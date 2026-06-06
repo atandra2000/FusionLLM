@@ -1,12 +1,75 @@
+# Python
 __pycache__/
-*.pyc
-*.pyo
-.DS_Store
+*.py[cod]
+*$py.class
+*.so
+*.egg
 *.egg-info/
 dist/
 build/
-.eggs/
-*.so
+eggs/
+*.whl
+pip-log.txt
+pip-delete-this-directory.txt
+
+# Virtual environments
 .env
 .venv/
 venv/
+ENV/
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# OS
+.DS_Store
+.DS_Store?
+._*
+.Spotlight-V100
+.Trashes
+Thumbs.db
+
+# Pytest
+.pytest_cache/
+.coverage
+htmlcov/
+coverage.xml
+
+# Mypy
+.mypy_cache/
+
+# Ruff
+.ruff_cache/
+
+# Jupyter
+.ipynb_checkpoints/
+
+# Training artifacts
+checkpoints/
+mlruns/
+wandb/
+*.pt
+*.bin
+*.safetensors
+
+# Data (large files)
+data/*.bin
+data/pretrain_data.bin
+data/validation_data.bin
+
+# Logs
+*.log
+runs/
+
+# Temp files
+*.tmp
+*.bak
+*.orig
+
+# Benchmark results
+.benchmarks/
+benchmark_results/

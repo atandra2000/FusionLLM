@@ -1,0 +1,41 @@
+# Pre-training stack — single / 8× NVIDIA A100 SXM 80GB (RunPod)
+#
+# Install PyTorch with CUDA 12.x first:
+#   pip install torch==2.7.0 --index-url https://download.pytorch.org/whl/cu128
+#
+# The canonical project file is `pyproject.toml`. This `requirements.txt`
+# is provided for non-uv users and for the GitHub Actions `pip install -r
+# requirements.txt` path. It pins to the same major.minor versions as
+# `pyproject.toml`; the lockfile of record is `uv.lock`.
+
+# Core
+torch==2.7.0
+transformers>=4.51.0,<5.0.0
+tokenizers>=0.20.0
+datasets>=3.0.0
+safetensors>=0.4.0
+pyyaml>=6.0
+tqdm>=4.66.0
+numpy>=1.24.0
+
+# Logging — W&B + MLflow (both are required, both must be installed)
+wandb>=0.17.0
+mlflow>=2.16.0
+
+# (Tier-2) BitLinear / ternary MoE experts.  Comment out for canonical profile.
+# bitsandbytes==0.45.0
+# torchao>=0.5.0
+
+# (Tier-2) Triton kernels (GDN, fused CE+softcap, fused Linear+ReLU²)
+# triton==3.2.0
+
+# (Tier-2) Flash-Attention 3
+# flash-attn==3.0.0b1
+
+# Development
+ruff>=0.4.0
+mypy>=1.10.0
+pre-commit>=3.7.0
+pytest>=8.2.0
+pytest-cov>=5.0.0
+pytest-benchmark>=4.0.0

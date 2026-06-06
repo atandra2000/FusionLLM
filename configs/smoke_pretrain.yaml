@@ -1,0 +1,115 @@
+# configs/smoke_pretrain.yaml
+# Minimal model + short run for end-to-end pipeline smoke tests (Phase 6.4).
+# Designed to complete in < 60 s on 1 GPU.
+
+training:
+  micro_batch_size: 1
+  gradient_accumulation_steps: 4
+  total_steps: 10
+  warmup_steps: 2
+
+  lr: 1e-4
+  muon_lr: 0.001
+  muon_momentum: 0.95
+  adamw_betas: [0.9, 0.95]
+  min_lr_ratio: 0.1
+  weight_decay: 0.1
+  cautious_wd: true
+  grad_clip: 1.0
+
+  dtype: bf16
+  use_checkpoint: true
+  save_dir: checkpoints/smoke
+  save_interval: 5
+  log_interval: 1
+
+  eval_enabled: true
+  eval_interval: 5
+  eval_max_batches: 2
+  eval_synthetic: true
+
+  curriculum_switch_step: 0
+  balance_loss_alpha: 1e-4
+  bias_update_speed: 1e-3
+  bias_update_every: 10
+
+  fsdp_shard_strategy: FULL_SHARD
+  fsdp_forward_prefetch: false
+  fsdp_backward_prefetch: true
+  fsdp_limit_all_gathers: true
+  fsdp_param_dtype: bf16
+  fsdp_reduce_dtype: fp32
+  shard_keep_last: 1
+  checkpoint_backend: safetensors
+
+  optimizer: normuon_adamw
+  scheduler: wsd
+  wsd_warmup_frac: 0.1
+  wsd_stable_frac: 0.7
+  wsd_decay: linear
+
+  batch_size_schedule_enabled: false
+  seq_len_schedule_enabled: false
+  fuse_ce_softcap: true
+  fuse_linear_relu2: true
+
+  wandb_enabled: false
+  mlflow_enabled: false
+
+hardware:
+  device: cuda
+  min_vram_gb: 1.0
+  n_gpus: 1
+  enable_tf32: true
+  cudnn_benchmark: false
+
+model:
+  vocab_size: 4096
+  max_seq_len: 256
+  dim: 64
+  n_layers: 2
+  layer_schedule: "1:1"
+
+  n_heads: 2
+  n_kv_groups: 1
+  q_lora_rank: 16
+  kv_lora_rank: 8
+  qk_nope_head_dim: 8
+  qk_rope_head_dim: 4
+  v_head_dim: 8
+  rope_theta: 10000.0
+  rope_factor: 1.0
+  qk_norm: false
+  sliding_window: 128
+
+  inter_dim: 128
+  ffn_activation: swiglu
+
+  n_routed_experts: 2
+  n_shared_experts: 1
+  n_activated_experts: 1
+  moe_inter_dim: 64
+  n_expert_groups: 1
+  n_limited_groups: 1
+
+  ssm_type: "gdn"
+  gdn_d_state: 16
+  gdn_d_conv: 2
+  gdn_headdim: 8
+
+  mtp_depth: 1
+  mtp_loss_weight: 0.3
+  mtp_softcap: true
+  mtp_softcap_value: 15.0
+
+  muP: false
+  logit_softcap: 0.0
+  asymmetric_rescale: false
+
+  mole_every_n: 0
+
+  tie_embeddings: true
+  no_bias_linear: true
+
+data:
+  train_data_path: data/smoke_data.bin

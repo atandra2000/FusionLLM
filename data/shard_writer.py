@@ -60,6 +60,11 @@ def write_shards(
     target_shard_tokens: int = TARGET_SHARD_TOKENS,
     max_seq_len: int = 8192,
     pad_token_id: int = -1,
+    source: str = "mixed",
+    weight: float = 1.0,
+    quality_score: float = 1.0,
+    domain: str | None = None,
+    shard_prefix: str = "shard",
 ) -> list[dict]:
     """Write token array to webdataset-style shards.
 
@@ -67,6 +72,13 @@ def write_shards(
 
     Returns a list of manifest rows (one per shard).  The caller
     writes them to ``shards/manifest.jsonl``.
+
+    Args:
+        source: dataset source label (e.g. ``"fineweb_edu"``).
+        weight: curriculum weight for this source.
+        quality_score: average quality score of this source.
+        domain: optional domain override (defaults to ``source``).
+        shard_prefix: filename prefix (e.g. ``"fineweb_edu_shard"``).
     """
     output_dir.mkdir(parents=True, exist_ok=True)
     shards_dir = output_dir / "shards"
@@ -75,18 +87,19 @@ def write_shards(
     n_tokens = tokens.numel()
     n_shards = max(1, (n_tokens + target_shard_tokens - 1) // target_shard_tokens)
     print(
-        f"\n[shards] writing {n_tokens:,} tokens \u2192 {n_shards} shard(s) of "
+        f"\n[shards] writing {n_tokens:,} tokens → {n_shards} shard(s) of "
         f"~{target_shard_tokens:,} tokens each at {shards_dir}"
     )
 
     manifest: list[dict] = []
     tokens_np = tokens.numpy().astype(np_dtype())
+    domain_label = domain or source
 
     for idx in range(n_shards):
         start = idx * target_shard_tokens
         end = min(start + target_shard_tokens, n_tokens)
         shard_tokens = tokens_np[start:end]
-        shard_path = shards_dir / f"shard_{idx:05d}.bin"
+        shard_path = shards_dir / f"{shard_prefix}_{idx:05d}.bin"
         _atomic_write_shard(shard_path, shard_tokens, max_seq_len, pad_token_id)
         size_gb = shard_path.stat().st_size / (1024**3)
         print(
@@ -96,10 +109,10 @@ def write_shards(
             {
                 "path": f"shards/{shard_path.name}",
                 "n_tokens": int(len(shard_tokens)),
-                "source": "mixed",
-                "weight": 1.0,
-                "quality_score": 1.0,
-                "domain": "mixed",
+                "source": source,
+                "weight": weight,
+                "quality_score": quality_score,
+                "domain": domain_label,
             }
         )
 

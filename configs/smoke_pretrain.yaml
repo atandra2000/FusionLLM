@@ -112,4 +112,4 @@ model:
   no_bias_linear: true
 
 data:
-  train_data_path: data/smoke_data.bin
+  shard_manifest_path: data/shards/manifest.jsonl

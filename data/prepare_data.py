@@ -2,44 +2,65 @@
 prepare_data.py
 ===============
 
-Dataset pipeline for the DeepSeek-V3-style pre-training skeleton
-(extended in Phase 1 to the 7-source SmolTalk-3-inspired mix).
+Dataset preparation pipeline for FusionLLM pre-training.
 
-Sources (Phase 1.2)
--------------------
+Collects text from 7 open-source datasets, applies language and
+quality filtering, deduplicates, tokenizes with block-packing, and
+writes per-source sharded mmap files that the training loop reads
+via :class:`data.async_loader.AsyncShardLoader`.
+
+Sources
+-------
    1. FineWeb-Edu       — high-quality web text with educational scoring
-   2. FineMath          — mathematical web text
+   2. FineMath          — mathematical web text (finemath-3plus)
    3. The-Stack-Edu     — code (Python / JS / Rust / Go / Java)
    4. Cosmopedia        — synthetic instructional text
    5. OpenR1-Math-220k  — math problem/solution pairs
-   6. FineWeb2          — multilingual web text (6 languages)
-   7. SmolLM-Corpus     — curated SmolLM corpus
+   6. FineWeb2          — multilingual web text
+   7. SmolLM-Corpus     — curated SmolLM pre-training corpus
 
 Pipeline stages
 ---------------
-   1. Collect   — stream each source up to MAX_DOCS per source
-   2. Filter    — language check + quality score threshold
-   3. Deduplicate — MinHash (1 M permutations, 5-gram, 64 bands)
-                    OR prefix dedup at 128 bytes (smoke tests)
-   4. Mix       — curriculum ordering, then shuffle
-   5. Split     — train / validation by VAL_RATIO
-   6. Tokenize  — block-pack at MAX_SEQ_LEN (4 K legacy / 8 K default)
-                  with EOS markers; resampling-aware packing.
-   7. Export    — sharded mmap (4 GB-token shards, int32 + 256-byte
-                  header) with a per-shard manifest.
+   1. Collect    — stream each source up to MAX_DOCS per source
+   2. Filter     — language check (fasttext or ASCII heuristic) +
+                   quality score threshold per source
+   3. Deduplicate — MinHash + LSH (256 permutations, 5-gram, 64 bands)
+                   with exact Jaccard confirmation, OR prefix dedup
+                   for smoke tests
+   4. Split      — train / validation split per source (VAL_RATIO)
+   5. Tokenize   — block-pack at MAX_SEQ_LEN (4 K legacy / 8 K default)
+                   with EOS markers; resampling-aware packing opt-in
+   6. Export     — per-source sharded mmap (int32 + 256-byte header)
+                   with a per-shard manifest.  Source labels are
+                   preserved so the curriculum sampler can filter
+                   and weight shards by training stage.
 
-Outputs (written to OUTPUT_DIR)
--------------------------------
-   shards/manifest.jsonl          — one row per shard (path, n_tokens,
-                                     source, weight, quality_score)
-   shards/shard_<idx>.bin         — packed int32 tokens + 256-byte header
-   dataset_meta.json              — tokenizer + dataset metadata
-   eval_samples.txt               — first 500 validation documents
+Outputs (written to ``OUTPUT_DIR``)
+------------------------------------
+   shards/manifest.jsonl            — one JSON row per shard with
+                                      path, n_tokens, source, weight,
+                                      quality_score, domain
+   shards/<source>_shard_<i>.bin    — packed int32 tokens + 256-byte
+                                      header (one file per shard)
+   dataset_meta.json                — tokenizer name, vocab size,
+                                      packing efficiency, source list
+   eval_samples.txt                 — first 500 validation documents
+                                      (all sources concatenated)
 
 Usage
 -----
-   python data/prepare_data.py [--output-dir data] [--seed 42] [--smoke]
-   python data/prepare_data.py --sources fineweb_edu openr1_math --max-fineweb 5000
+   # Full run (all 7 sources)
+   python data/prepare_data.py --output-dir data --seed 42
+
+   # Smoke test (single source, prefix dedup)
+   python data/prepare_data.py --smoke
+
+   # Selective sources with custom caps
+   python data/prepare_data.py --sources fineweb_edu openr1_math \\
+       --max-fineweb-edu 5000 --max-openr1-math 2000
+
+   # Dry run (stats only, no files written)
+   python data/prepare_data.py --dry-run
 """
 
 from __future__ import annotations
@@ -57,7 +78,7 @@ from typing import Dict, Iterator, List, Optional, Tuple
 import torch
 
 # ── Configuration ──────────────────────────────────────────────────────────
-TOKENIZER_NAME = "Qwen/Qwen2.5-3B-Instruct"
+TOKENIZER_NAME = "Qwen/Qwen2.5-3B"
 OUTPUT_DIR = "data"
 
 # Phase 1.2: seven sources. The default mix is the SmolTalk-3-inspired
@@ -103,7 +124,7 @@ QUALITY_THRESHOLD = {
 TARGET_SHARD_TOKENS = 4_000_000_000  # 4 B tokens
 
 # MinHash dedup defaults (Phase 1.1). Override via CLI.
-MINHASH_NUM_PERM = 1_000_000
+MINHASH_NUM_PERM = 256
 MINHASH_NUM_BANDS = 64
 MINHASH_NGRAM = 5
 
@@ -221,14 +242,18 @@ def _collect_finemath(max_docs: int) -> list[Doc]:
 
 
 def _collect_stack_edu(max_docs: int) -> list[Doc]:
-    from datasets import load_dataset
+    from datasets import load_dataset, concatenate_datasets
 
     print(f"\n[3/7] Loading The-Stack-Edu (up to {max_docs:,} docs)...")
-    # The-Stack-dedup is the base; "edu" filter is applied via a
-    # subset config where available.
-    ds = load_dataset("bigcode/the-stack-dedup", data_dir="python", split=f"train[:{max_docs}]")
+    languages = ["python", "javascript", "rust", "go", "java"]
+    per_lang = max(1, max_docs // len(languages))
+    all_docs: list[Doc] = []
     threshold = QUALITY_THRESHOLD["stack_edu"]
-    return _filter_docs(ds, text_field="content", threshold=threshold, desc="stack_edu")
+    for lang in languages:
+        ds = load_dataset("bigcode/the-stack-dedup", data_dir=lang, split=f"train[:{per_lang}]")
+        docs = _filter_docs(ds, text_field="content", threshold=threshold, desc=f"stack_edu/{lang}")
+        all_docs.extend(docs)
+    return all_docs[:max_docs]
 
 
 def _collect_cosmopedia(max_docs: int) -> list[Doc]:
@@ -272,7 +297,7 @@ def _collect_smollm_corpus(max_docs: int) -> list[Doc]:
     from datasets import load_dataset
 
     print(f"\n[7/7] Loading SmolLM-Corpus (up to {max_docs:,} docs)...")
-    ds = load_dataset("HuggingFaceTB/smol-smoltalk", split=f"train[:{max_docs}]")
+    ds = load_dataset("HuggingFaceTB/SmolLM-Corpus", split=f"train[:{max_docs}]")
     threshold = QUALITY_THRESHOLD["smollm_corpus"]
     return _filter_docs(ds, text_field="text", threshold=threshold, desc="smollm_corpus")
 
@@ -329,19 +354,6 @@ def deduplicate(docs: list[Doc], *, strategy: str = "minhash", **kw) -> list[Doc
     out = deduplicate_docs(docs, strategy=strategy, **kw)
     removed = len(docs) - len(out)
     print(f"    removed {removed:,} duplicates → {len(out):,} unique docs")
-    return out
-
-
-# ── Curriculum mixing (Phase 1.6 stub) ────────────────────────────────────
-def curriculum_mix(by_source: dict[str, list[Doc]]) -> list[Doc]:
-    """Concatenate per-source lists, sorted by descending quality.
-
-    The actual *sampling weights* (the curriculum manifest) live in
-    `data/curriculum.py`. This function only orders the docs.
-    """
-    out: list[Doc] = []
-    for source, docs in by_source.items():
-        out.extend(sorted(docs, key=lambda x: -x[1]))
     return out
 
 
@@ -537,14 +549,13 @@ def main() -> None:
         max_per_source = {s: getattr(args, f"max_{s}") for s in sources}
         dedup_strategy = args.dedup_strategy
 
-    # ── Collect ────────────────────────────────────────────────────────
+    # ── Collect per source ────────────────────────────────────────────
     by_source: dict[str, list[Doc]] = {}
     for s in sources:
         by_source[s] = collect(s, max_per_source[s])
         print(f"  {s:>15s}: {len(by_source[s]):>8,}")
 
-    # ── Mix → dedup → shuffle ─────────────────────────────────────────
-    mixed = curriculum_mix(by_source)
+    # ── Deduplicate per source (preserves source labels) ──────────────
     dedup_kw = {}
     if dedup_strategy == "minhash":
         dedup_kw = {
@@ -552,72 +563,109 @@ def main() -> None:
             "num_bands": args.minhash_num_bands,
             "ngram": args.minhash_ngram,
         }
-    unique = deduplicate(mixed, strategy=dedup_strategy, **dedup_kw)
-    random.shuffle(unique)
-    print(f"\nFinal unique docs after shuffle: {len(unique):,}")
+    unique_by_source: dict[str, list[Doc]] = {}
+    total_unique = 0
+    for s, docs in by_source.items():
+        unique = deduplicate(docs, strategy=dedup_strategy, **dedup_kw)
+        random.shuffle(unique)
+        unique_by_source[s] = unique
+        total_unique += len(unique)
+        print(f"  {s:>15s}: {len(unique):>8,} unique docs")
+    print(f"\nTotal unique docs after shuffle: {total_unique:,}")
 
-    # ── Train / val split ──────────────────────────────────────────────
-    split_idx = int(len(unique) * (1.0 - args.val_ratio))
-    train_docs = unique[:split_idx]
-    val_docs = unique[split_idx:]
-    print(f"\nTrain docs: {len(train_docs):,}")
-    print(f"Val docs:   {len(val_docs):,}  ({args.val_ratio * 100:.1f}%)")
-
-    # ── Tokenize & pack ────────────────────────────────────────────────
+    # ── Tokenize & pack per source ────────────────────────────────────
     print(f"\nLoading tokenizer ({TOKENIZER_NAME})...")
     tokenizer = load_tokenizer()
 
-    print("\nTokenizing train set...")
-    train_tokens, train_packing_eff = tokenize_and_pack(
-        train_docs,
-        tokenizer,
-        max_seq_len=args.max_seq_len,
-        resample=args.resample,
-        desc="train",
-    )
+    all_manifest: list[dict] = []
+    all_eval_docs: list[Doc] = []
+    total_train_tokens = 0
+    total_val_tokens = 0
+    total_train_packing = 0.0
+    total_val_packing = 0.0
 
-    print("\nTokenizing validation set...")
-    val_tokens, val_packing_eff = tokenize_and_pack(
-        val_docs,
-        tokenizer,
-        max_seq_len=args.max_seq_len,
-        resample=args.resample,
-        desc="val",
-    )
+    for s, docs in unique_by_source.items():
+        # Train/val split per source
+        split_idx = int(len(docs) * (1.0 - args.val_ratio))
+        train_docs = docs[:split_idx]
+        val_docs = docs[split_idx:]
+
+        print(f"\n{'='*60}")
+        print(f"Source: {s} | Train: {len(train_docs):,} | Val: {len(val_docs):,}")
+        print(f"{'='*60}")
+
+        if train_docs:
+            print(f"\nTokenizing train set ({s})...")
+            train_tokens, train_packing = tokenize_and_pack(
+                train_docs,
+                tokenizer,
+                max_seq_len=args.max_seq_len,
+                resample=args.resample,
+                desc=f"train/{s}",
+            )
+            total_train_tokens += train_tokens.numel()
+            total_train_packing += train_packing
+
+            if not args.dry_run:
+                source_manifest = write_shards(
+                    train_tokens,
+                    output_dir,
+                    target_shard_tokens=args.target_shard_tokens,
+                    max_seq_len=args.max_seq_len,
+                    pad_token_id=tokenizer.pad_token_id,
+                    source=s,
+                    quality_score=QUALITY_THRESHOLD.get(s, 0.8),
+                    shard_prefix=f"{s}_shard",
+                )
+                all_manifest.extend(source_manifest)
+
+        if val_docs:
+            print(f"\nTokenizing validation set ({s})...")
+            val_tokens, val_packing = tokenize_and_pack(
+                val_docs,
+                tokenizer,
+                max_seq_len=args.max_seq_len,
+                resample=args.resample,
+                desc=f"val/{s}",
+            )
+            total_val_tokens += val_tokens.numel()
+            total_val_packing += val_packing
+
+        all_eval_docs.extend(val_docs)
 
     # ── Stats ──────────────────────────────────────────────────────────
     bytes_per_token = 4  # int32
-    train_gb = train_tokens.numel() * bytes_per_token / 1024**3
-    val_gb = val_tokens.numel() * bytes_per_token / 1024**3
+    train_gb = total_train_tokens * bytes_per_token / 1024**3
+    val_gb = total_val_tokens * bytes_per_token / 1024**3
+    n_sources_with_train = sum(1 for s in unique_by_source if unique_by_source[s][:int(len(unique_by_source[s]) * (1.0 - args.val_ratio))])
+    avg_train_packing = total_train_packing / max(n_sources_with_train, 1)
+    n_sources_with_val = sum(1 for s in unique_by_source if unique_by_source[s][int(len(unique_by_source[s]) * (1.0 - args.val_ratio)):])
+    avg_val_packing = total_val_packing / max(n_sources_with_val, 1)
+
     print("\n" + "=" * 60)
     print("Dataset summary")
     print("=" * 60)
-    print(f"  Train tokens : {len(train_tokens):>14,}  (~{train_gb:.2f} GB on disk)")
-    print(f"  Val tokens   : {len(val_tokens):>14,}  (~{val_gb:.2f} GB on disk)")
-    print(f"  Train packing efficiency : {train_packing_eff * 100:.2f}%")
-    print(f"  Val packing efficiency   : {val_packing_eff * 100:.2f}%")
-    print(f"  Train seqs   : {len(train_tokens) // args.max_seq_len:>14,}")
-    print(f"  Val seqs     : {len(val_tokens) // args.max_seq_len:>14,}")
+    print(f"  Sources       : {len(unique_by_source)}")
+    print(f"  Train tokens  : {total_train_tokens:>14,}  (~{train_gb:.2f} GB on disk)")
+    print(f"  Val tokens    : {total_val_tokens:>14,}  (~{val_gb:.2f} GB on disk)")
+    print(f"  Train packing : {avg_train_packing * 100:.2f}% (avg across sources)")
+    print(f"  Val packing   : {avg_val_packing * 100:.2f}% (avg across sources)")
+    print(f"  Train seqs    : {total_train_tokens // args.max_seq_len:>14,}")
+    print(f"  Val seqs      : {total_val_tokens // args.max_seq_len:>14,}")
     print("=" * 60)
 
     if args.dry_run:
         print("\n--dry-run: skipping file writes.")
         return
 
-    # ── Write shards ───────────────────────────────────────────────────
+    # ── Write manifest ────────────────────────────────────────────────
     output_dir.mkdir(parents=True, exist_ok=True)
-    manifest = write_shards(
-        train_tokens,
-        output_dir,
-        target_shard_tokens=args.target_shard_tokens,
-        max_seq_len=args.max_seq_len,
-        pad_token_id=tokenizer.pad_token_id,
-    )
-    write_manifest(manifest, output_dir)
+    if all_manifest:
+        write_manifest(all_manifest, output_dir)
 
     # ── Eval samples ───────────────────────────────────────────────────
     print("\nExporting eval samples...")
-    export_eval_samples(val_docs, output_dir)
+    export_eval_samples(all_eval_docs, output_dir)
 
     # ── Dataset meta ───────────────────────────────────────────────────
     meta = {
@@ -626,12 +674,13 @@ def main() -> None:
         "pad_token_id": tokenizer.pad_token_id,
         "eos_token_id": tokenizer.eos_token_id,
         "max_seq_len": args.max_seq_len,
-        "train_tokens": int(train_tokens.numel()),
-        "val_tokens": int(val_tokens.numel()),
-        "train_packing_efficiency": train_packing_eff,
-        "val_packing_efficiency": val_packing_eff,
+        "train_tokens": total_train_tokens,
+        "val_tokens": total_val_tokens,
+        "train_packing_efficiency": avg_train_packing,
+        "val_packing_efficiency": avg_val_packing,
         "sources": sources,
         "dedup_strategy": dedup_strategy,
+        "curriculum_enabled": True,
     }
     meta_path = output_dir / "dataset_meta.json"
     with open(meta_path, "w", encoding="utf-8") as f:

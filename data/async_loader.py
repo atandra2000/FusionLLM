@@ -381,8 +381,13 @@ class AsyncShardLoader:
         filling, the worker pushes the (tokens, targets) pair to
         the queue.  The main thread then ``.to(self.device,
         non_blocking=True)``-copies.
+
+        The worker rotates through ``micro_prefetch`` pinned buffer
+        slots to enable pipelining: slot N is being filled while
+        slots 0..N-1 are in flight to the GPU.
         """
         rng = random.Random(self.seed)
+        slot_idx = 0
         try:
             for shard in self.index:
                 with open_shard(self.root / shard.path) as arr:
@@ -390,30 +395,29 @@ class AsyncShardLoader:
                     need = self._mb_tokens
                     if n < need:
                         continue
-                    # We iterate over the shard in chunks of `need`
-                    # tokens, with a random per-epoch permutation
-                    # of the chunk starts.
                     chunk_starts = list(range(0, n - need + 1, need))
                     rng.shuffle(chunk_starts)
                     for start in chunk_starts:
                         if self._shutdown.is_set():
                             return
-                        # Fill one slice of the pinned buffer
-                        slot = self._pinned_buf[0]  # we only use 1 of N
+                        # Rotate through pinned buffer slots
+                        slot = self._pinned_buf[slot_idx % self.micro_prefetch]
                         page = slot.numpy()
                         np.copyto(
                             page,
                             np.asarray(arr[start : start + need], dtype=np.int64),
                         )
-                        # Build targets (left-shift) on the page
-                        tokens = self._pinned_buf[0].clone()
+                        # Clone from the filled slot so the next slot
+                        # can be written concurrently
+                        tokens = slot.clone()
                         targets = torch.empty_like(tokens)
                         targets[:, :-1] = tokens[:, 1:]
-                        targets[:, -1] = -100  # ignore the last target
+                        targets[:, -1] = -100
                         # H2D (non-blocking)
                         tokens = tokens.to(self.device, non_blocking=True)
                         targets = targets.to(self.device, non_blocking=True)
                         self._mb_queue.put((tokens, targets))
+                        slot_idx += 1
         except Exception as exc:
             # Surface the error to the trainer via the queue
             self._mb_queue.put(("__error__", exc))

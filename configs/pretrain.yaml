@@ -232,13 +232,14 @@ model:
 
 # ── Data ─────────────────────────────────────────────────────────────────────
 data:
-  train_data_path: data/pretrain_data.bin
-  val_data_path: data/validation_data.bin
+  shard_manifest_path: data/shards/manifest.jsonl
+  # Legacy flat-file paths (used only when shard_manifest_path is absent)
+  # train_data_path: data/pretrain_data.bin
+  # val_data_path: data/validation_data.bin
   # SmolLM2-style multi-stage data mix (Q2 milestone):
   #   FineWeb-Edu (web, 60 %) + FineMath (math, 15 %) +
   #   Stack-Edu (code, 15 %) + Cosmopedia (synthetic instr, 5 %) +
   #   OpenR1-Math-220k (reasoning, 5 %)
-  # Currently: FineWeb-Edu is the only one wired (see data/prepare_data.py).
   data_mix:
     fineweb_edu: 0.60
     finemath: 0.15

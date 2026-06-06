@@ -9,7 +9,7 @@ Three strategies, in increasing cost and precision:
   pre-Phase-1 ``near_duplicate_key`` helper in
   ``data/prepare_data.py``. O(1) per doc.
 * :class:`MinHashHasher` + :class:`LSHIndex` — the real workhorse.
-  1 M permutations, 5-gram shingle, 64 LSH bands.  Catches
+  256 permutations, 5-gram shingle, 64 LSH bands.  Catches
   near-duplicates that the prefix check misses.  O(num_perm) per
   doc, O(num_bands) per candidate in the LSH.
 
@@ -21,7 +21,7 @@ by first-seen order.
 
 Public surface
 --------------
-* :func:`deduplicate_docs(docs, *, strategy="minhash", num_perm=1_000_000,
+* :func:`deduplicate_docs(docs, *, strategy="minhash", num_perm=256,
   ngram=5, num_bands=64, prefix_bytes=128, min_dup_chars=120)`
 * :class:`MinHashHasher`
 * :class:`LSHIndex`
@@ -123,12 +123,12 @@ class MinHashHasher:
     :class:`LSHIndex` detects).
 
     Args:
-        num_perm: number of permutations (default 1 000 000).
+        num_perm: number of permutations (default 256).
         ngram: shingle size in words (default 5).
         seed: PRNG seed (default 0 — must be stable for resume).
     """
 
-    def __init__(self, num_perm: int = 1_000_000, ngram: int = 5, seed: int = 0):
+    def __init__(self, num_perm: int = 256, ngram: int = 5, seed: int = 0):
         self.num_perm = num_perm
         self.ngram = ngram
         # Single 64-bit hash family: splitmix64.  We pre-compute the
@@ -192,12 +192,12 @@ class LSHIndex:
         ``1 - (1 - s**num_rows) ** num_bands ≈ 0.5`` at
         ``s ≈ (1/num_bands) ** (1/num_rows)``.
 
-    With ``num_perm=1_000_000`` and ``num_bands=64``,
-    ``num_rows=15_625`` and the S-curve is essentially a step
-    function: anything below Jaccard 0.85 is *not* a candidate.
+    With ``num_perm=256`` and ``num_bands=64``,
+    ``num_rows=4`` and the S-curve has a smooth transition around
+    Jaccard 0.6–0.8, suitable for near-duplicate detection.
     """
 
-    def __init__(self, num_perm: int = 1_000_000, num_bands: int = 64):
+    def __init__(self, num_perm: int = 256, num_bands: int = 64):
         if num_perm % num_bands != 0:
             raise ValueError(f"num_perm ({num_perm}) must be divisible by num_bands ({num_bands})")
         self.num_perm = num_perm
@@ -250,7 +250,7 @@ def deduplicate_docs(
     docs: Sequence[Doc],
     *,
     strategy: str = "minhash",
-    num_perm: int = 1_000_000,
+    num_perm: int = 256,
     ngram: int = 5,
     num_bands: int = 64,
     prefix_bytes: int = 128,
@@ -267,7 +267,7 @@ def deduplicate_docs(
         strategy: one of ``"minhash"`` (default), ``"prefix"``,
             ``"md5"``.  ``"minhash"`` is the canonical path; the
             other two are smoke-test fallbacks.
-        num_perm: MinHash permutations (default 1 M).
+        num_perm: MinHash permutations (default 256).
         ngram: shingle size in words (default 5).
         num_bands: LSH bands (default 64).  Must divide ``num_perm``.
         prefix_bytes: bytes used by ``"prefix"`` strategy (default 128).

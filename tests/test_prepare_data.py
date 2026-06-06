@@ -33,7 +33,6 @@ from data.prepare_data import (
     QUALITY_THRESHOLD,
     TARGET_SHARD_TOKENS,
     _filter_docs,
-    curriculum_mix,
     deduplicate,
     export_eval_samples,
     normalize,
@@ -67,7 +66,7 @@ class TestConfig:
             assert src in QUALITY_THRESHOLD, f"missing threshold for {src}"
 
     def test_minhash_defaults(self):
-        assert MINHASH_NUM_PERM == 1_000_000
+        assert MINHASH_NUM_PERM == 256
         assert MINHASH_NUM_BANDS == 64
 
     def test_default_max_seq_len_is_8k(self):
@@ -141,21 +140,6 @@ class TestSourceDispatcher:
         for src in MAX_DOCS:
             assert src in _COLLECTORS
             assert callable(_COLLECTORS[src])
-
-
-# ── Curriculum mix ─────────────────────────────────────────────────────────
-class TestCurriculumMix:
-    def test_concatenates_per_source(self):
-        by_source = {
-            "fineweb_edu": [("a", 0.5), ("b", 1.5)],
-            "openr1_math": [("c", 1.0)],
-        }
-        out = curriculum_mix(by_source)
-        # Per-source sort by descending quality: [b, a] + [c]
-        assert [t for t, _ in out] == ["b", "a", "c"]
-
-    def test_empty_input(self):
-        assert curriculum_mix({}) == []
 
 
 # ── Block-pack (tokenize_and_pack) ─────────────────────────────────────────

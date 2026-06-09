@@ -73,3 +73,18 @@ runs/
 # Benchmark results
 .benchmarks/
 benchmark_results/
+
+# Development tools (local only)
+.opencode/
+.opencode/**
+graphify-out/
+graphify-out/**
+.graphifyignore
+.graphify/
+.graphify/**
+instruction.md
+study_sources.md
+
+# Test files (can be added back if needed)
+tests/
+tests/**

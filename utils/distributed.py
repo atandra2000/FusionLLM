@@ -10,7 +10,7 @@ Identity
   via the standard ``torchrun`` env-vars.
 * NCCL backend for GPU collectives; bf16 reduced precision for
   FSDP2 all-gathers.
-* Async checkpointing and async W&B / MLflow logging are owned by
+* Async checkpointing and async W&B logging are owned by
   their respective modules; this file is for setup + collectives.
 
 The FSDP2 wrapping policy is conservative: per-TransformerBlock

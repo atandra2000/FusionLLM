@@ -35,16 +35,14 @@ from training.checkpointing import find_latest_checkpoint, load_checkpoint, save
 from training.curriculum_manager import advance_curriculum, init_curriculum
 from training.dataset import PretrainDataset
 from training.numerical_health import init_health_monitor, init_runs_csv, register_spike_callback
-from training.optimization import Muon, build_optimizers
+from training.optimization import build_optimizers
 from training.schedules import BatchSizeSchedule, SeqLenSchedule
 from training.train_step import train_step
 from training.validation import maybe_eval
 from training.wsd import WSDScheduler
 from utils.checkpoint import CheckpointManager
 from utils.distributed import (
-    cleanup_distributed,
     configure_reshard,
-    is_main_process,
     setup_distributed,
     wrap_fsdp2,
 )
@@ -74,12 +72,6 @@ class Pretrainer:
             wandb_tags=log_cfg.wandb_tags,
             wandb_config=asdict(config),
             wandb_enabled=log_cfg.wandb_enabled,
-            mlflow_tracking_uri=log_cfg.mlflow_tracking_uri,
-            mlflow_experiment_name=log_cfg.mlflow_experiment_name,
-            mlflow_run_name=log_cfg.mlflow_run_name,
-            mlflow_tags=log_cfg.mlflow_tags,
-            mlflow_config=asdict(config),
-            mlflow_enabled=log_cfg.mlflow_enabled,
         )
         self.logger = get_logger()
 

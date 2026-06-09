@@ -1,0 +1,114 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+env/
+venv/
+ENV/
+build/
+develop-eggs/
+dist/
+downloads/
+eggs/
+.eggs/
+lib/
+lib64/
+parts/
+sdist/
+var/
+*.egg-info/
+.installed.cfg
+*.egg
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+.DS_Store
+
+# Testing
+.coverage
+htmlcov/
+.tox/
+.nox/
+.pytest_cache/
+.coverage.*
+
+# Documentation (usually not needed in code graph)
+docs/
+*.md
+!src/**/*.md
+
+# Generated files
+*.generated.*
+*.pb.go
+*.pb.rs
+generated/
+
+# Build artifacts
+node_modules/
+dist/
+out/
+target/
+*.o
+*.a
+*.lib
+
+# Logs and cache
+*.log
+.cache/
+.temp/
+tmp/
+temp/
+*.tmp
+
+# Tests
+tests/
+test/
+spec/
+*_test.go
+_test.py
+.test.js
+
+# CI/CD
+.github/
+.gitlab-ci.yml
+.travis.yml
+Jenkinsfile
+
+# Docker
+Dockerfile
+.dockerignore
+
+# License and config files (usually not needed)
+LICENSE*
+README*
+CHANGELOG*
+CONTRIBUTING*
+SECURITY.md
+
+# Large binary assets
+*.jpg
+*.jpeg
+*.png
+*.gif
+*.mp4
+*.mov
+*.mkv
+*.zip
+*.tar
+*.tar.gz
+*.rar
+*.7z
+
+# Data files
+*.csv
+*.jsonl
+*.ndjson
+*.db
+*.sqlite
+*.sqlite3

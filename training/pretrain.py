@@ -11,7 +11,7 @@ Identity
 * Per-expert aux-loss-free bias update via ``DeepSeekMoE.update_gate_bias``.
 * Async checkpointing is the caller's choice (``CheckpointManager`` is
   already async; this loop just calls ``ckpt_manager.save()``).
-* W&B + MLflow dual logging; TrainerLogger mirrors to both.
+* W&B logging; TrainerLogger logs to W&B.
 
 This module is the thin entrypoint. Training logic is in trainer.py.
 """
@@ -108,11 +108,6 @@ def build_config_from_yaml(yaml_cfg: dict, args: argparse.Namespace) -> ConfigBu
         wandb_entity=t.get("wandb_entity"),
         wandb_run_name=t.get("wandb_run_name"),
         wandb_tags=t.get("wandb_tags", []),
-        mlflow_enabled=t.get("mlflow_enabled", True),
-        mlflow_tracking_uri=t.get("mlflow_tracking_uri"),
-        mlflow_experiment_name=t.get("mlflow_experiment_name"),
-        mlflow_run_name=t.get("mlflow_run_name"),
-        mlflow_tags=t.get("mlflow_tags", {}),
     )
 
     return ConfigBundle(

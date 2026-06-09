@@ -83,11 +83,6 @@ class LoggingConfig:
     wandb_entity: str | None = None
     wandb_run_name: str | None = None
     wandb_tags: list[str] | None = None
-    mlflow_enabled: bool = True
-    mlflow_tracking_uri: str | None = None
-    mlflow_experiment_name: str | None = None
-    mlflow_run_name: str | None = None
-    mlflow_tags: dict | None = None
 
 
 @dataclass

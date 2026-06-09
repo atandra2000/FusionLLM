@@ -1,0 +1,410 @@
+{
+  "colorGroups": [
+    {
+      "query": "tag:#community/Training_Pipeline",
+      "color": {
+        "a": 1,
+        "rgb": 5142951
+      }
+    },
+    {
+      "query": "tag:#community/Data_Preparation",
+      "color": {
+        "a": 1,
+        "rgb": 15896107
+      }
+    },
+    {
+      "query": "tag:#community/NCCL_Profiler",
+      "color": {
+        "a": 1,
+        "rgb": 14767961
+      }
+    },
+    {
+      "query": "tag:#community/Deduplication",
+      "color": {
+        "a": 1,
+        "rgb": 7780274
+      }
+    },
+    {
+      "query": "tag:#community/Training_Benchmarks",
+      "color": {
+        "a": 1,
+        "rgb": 5873999
+      }
+    },
+    {
+      "query": "tag:#community/Numerical_Health",
+      "color": {
+        "a": 1,
+        "rgb": 15583560
+      }
+    },
+    {
+      "query": "tag:#community/Multi-Token_Prediction",
+      "color": {
+        "a": 1,
+        "rgb": 11565729
+      }
+    },
+    {
+      "query": "tag:#community/Loss_Functions",
+      "color": {
+        "a": 1,
+        "rgb": 16752039
+      }
+    },
+    {
+      "query": "tag:#community/Delta_Rule",
+      "color": {
+        "a": 1,
+        "rgb": 10253663
+      }
+    },
+    {
+      "query": "tag:#community/Async_Data_Loader",
+      "color": {
+        "a": 1,
+        "rgb": 12234924
+      }
+    },
+    {
+      "query": "tag:#community/Transformer_Blocks",
+      "color": {
+        "a": 1,
+        "rgb": 5142951
+      }
+    },
+    {
+      "query": "tag:#community/DeepSeek_MoE",
+      "color": {
+        "a": 1,
+        "rgb": 15896107
+      }
+    },
+    {
+      "query": "tag:#community/Async_Checkpoint",
+      "color": {
+        "a": 1,
+        "rgb": 14767961
+      }
+    },
+    {
+      "query": "tag:#community/Checkpoint_Loading",
+      "color": {
+        "a": 1,
+        "rgb": 7780274
+      }
+    },
+    {
+      "query": "tag:#community/MLA_Attention",
+      "color": {
+        "a": 1,
+        "rgb": 5873999
+      }
+    },
+    {
+      "query": "tag:#community/Checkpoint_Manager",
+      "color": {
+        "a": 1,
+        "rgb": 15583560
+      }
+    },
+    {
+      "query": "tag:#community/NorMuon_Optimizer",
+      "color": {
+        "a": 1,
+        "rgb": 11565729
+      }
+    },
+    {
+      "query": "tag:#community/Distributed_Comm",
+      "color": {
+        "a": 1,
+        "rgb": 16752039
+      }
+    },
+    {
+      "query": "tag:#community/Compile_Benchmarks",
+      "color": {
+        "a": 1,
+        "rgb": 10253663
+      }
+    },
+    {
+      "query": "tag:#community/Expert_Dispatch",
+      "color": {
+        "a": 1,
+        "rgb": 12234924
+      }
+    },
+    {
+      "query": "tag:#community/Atomic_Checkpoint",
+      "color": {
+        "a": 1,
+        "rgb": 5142951
+      }
+    },
+    {
+      "query": "tag:#community/FSDP_Checkpoint",
+      "color": {
+        "a": 1,
+        "rgb": 15896107
+      }
+    },
+    {
+      "query": "tag:#community/Mamba_Blocks",
+      "color": {
+        "a": 1,
+        "rgb": 14767961
+      }
+    },
+    {
+      "query": "tag:#community/Logging",
+      "color": {
+        "a": 1,
+        "rgb": 7780274
+      }
+    },
+    {
+      "query": "tag:#community/Checkpoint_Retention",
+      "color": {
+        "a": 1,
+        "rgb": 5873999
+      }
+    },
+    {
+      "query": "tag:#community/Curriculum",
+      "color": {
+        "a": 1,
+        "rgb": 15583560
+      }
+    },
+    {
+      "query": "tag:#community/CE_Softcap",
+      "color": {
+        "a": 1,
+        "rgb": 11565729
+      }
+    },
+    {
+      "query": "tag:#community/Scheduler_&_Setup",
+      "color": {
+        "a": 1,
+        "rgb": 16752039
+      }
+    },
+    {
+      "query": "tag:#community/Async_Sharding",
+      "color": {
+        "a": 1,
+        "rgb": 10253663
+      }
+    },
+    {
+      "query": "tag:#community/Curriculum_Shards",
+      "color": {
+        "a": 1,
+        "rgb": 12234924
+      }
+    },
+    {
+      "query": "tag:#community/Scheduling",
+      "color": {
+        "a": 1,
+        "rgb": 5142951
+      }
+    },
+    {
+      "query": "tag:#community/Compilation",
+      "color": {
+        "a": 1,
+        "rgb": 15896107
+      }
+    },
+    {
+      "query": "tag:#community/Hardware_Config",
+      "color": {
+        "a": 1,
+        "rgb": 14767961
+      }
+    },
+    {
+      "query": "tag:#community/MoE_Benchmarks",
+      "color": {
+        "a": 1,
+        "rgb": 7780274
+      }
+    },
+    {
+      "query": "tag:#community/Activation_Monitor",
+      "color": {
+        "a": 1,
+        "rgb": 5873999
+      }
+    },
+    {
+      "query": "tag:#community/Linear_ReLU\u00b2",
+      "color": {
+        "a": 1,
+        "rgb": 15583560
+      }
+    },
+    {
+      "query": "tag:#community/Expert_Forward",
+      "color": {
+        "a": 1,
+        "rgb": 11565729
+      }
+    },
+    {
+      "query": "tag:#community/Routing_Gate",
+      "color": {
+        "a": 1,
+        "rgb": 16752039
+      }
+    },
+    {
+      "query": "tag:#community/RoPE",
+      "color": {
+        "a": 1,
+        "rgb": 10253663
+      }
+    },
+    {
+      "query": "tag:#community/Script_Configs_1",
+      "color": {
+        "a": 1,
+        "rgb": 12234924
+      }
+    },
+    {
+      "query": "tag:#community/Script_Configs_2",
+      "color": {
+        "a": 1,
+        "rgb": 5142951
+      }
+    },
+    {
+      "query": "tag:#community/Health_Monitor",
+      "color": {
+        "a": 1,
+        "rgb": 15896107
+      }
+    },
+    {
+      "query": "tag:#community/Distributed_Wrap",
+      "color": {
+        "a": 1,
+        "rgb": 14767961
+      }
+    },
+    {
+      "query": "tag:#community/Tensor_Validation",
+      "color": {
+        "a": 1,
+        "rgb": 7780274
+      }
+    },
+    {
+      "query": "tag:#community/MoE_Routing",
+      "color": {
+        "a": 1,
+        "rgb": 5873999
+      }
+    },
+    {
+      "query": "tag:#community/Shard_Index",
+      "color": {
+        "a": 1,
+        "rgb": 15583560
+      }
+    },
+    {
+      "query": "tag:#community/Flash_Attention",
+      "color": {
+        "a": 1,
+        "rgb": 11565729
+      }
+    },
+    {
+      "query": "tag:#community/Parallel_Embedding",
+      "color": {
+        "a": 1,
+        "rgb": 16752039
+      }
+    },
+    {
+      "query": "tag:#community/Config_Bundle",
+      "color": {
+        "a": 1,
+        "rgb": 10253663
+      }
+    },
+    {
+      "query": "tag:#community/Best_Model_Tracker",
+      "color": {
+        "a": 1,
+        "rgb": 12234924
+      }
+    },
+    {
+      "query": "tag:#community/MoLE_Model",
+      "color": {
+        "a": 1,
+        "rgb": 5142951
+      }
+    },
+    {
+      "query": "tag:#community/Runs_Logger",
+      "color": {
+        "a": 1,
+        "rgb": 15896107
+      }
+    },
+    {
+      "query": "tag:#community/muP",
+      "color": {
+        "a": 1,
+        "rgb": 14767961
+      }
+    },
+    {
+      "query": "tag:#community/Health_Checks",
+      "color": {
+        "a": 1,
+        "rgb": 7780274
+      }
+    },
+    {
+      "query": "tag:#community/Shard_Sampler",
+      "color": {
+        "a": 1,
+        "rgb": 5873999
+      }
+    },
+    {
+      "query": "tag:#community/Smoke_Script",
+      "color": {
+        "a": 1,
+        "rgb": 15583560
+      }
+    },
+    {
+      "query": "tag:#community/Cautious_Optimizer",
+      "color": {
+        "a": 1,
+        "rgb": 11565729
+      }
+    },
+    {
+      "query": "tag:#community/Grouped_GEMM",
+      "color": {
+        "a": 1,
+        "rgb": 12234924
+      }
+    }
+  ]
+}

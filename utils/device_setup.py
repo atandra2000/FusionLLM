@@ -34,7 +34,6 @@ class HardwareConfig:
     empty_cache_every: int = 0
     async_checkpointing: bool = True
     async_wandb: bool = True
-    async_mlflow: bool = True
     use_mmap_data: bool = True
     enable_nvlink_check: bool = True
 
@@ -57,7 +56,6 @@ def parse_hardware_config(yaml_hw: dict | None) -> HardwareConfig:
         empty_cache_every=int(yaml_hw.get("empty_cache_every", 0)),
         async_checkpointing=bool(yaml_hw.get("async_checkpointing", True)),
         async_wandb=bool(yaml_hw.get("async_wandb", True)),
-        async_mlflow=bool(yaml_hw.get("async_mlflow", True)),
         use_mmap_data=bool(yaml_hw.get("use_mmap_data", True)),
         enable_nvlink_check=bool(yaml_hw.get("enable_nvlink_check", True)),
     )

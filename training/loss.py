@@ -13,7 +13,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from dataclasses import dataclass
-from typing import Optional, Dict, Tuple
+from typing import Optional, Dict
 
 
 @dataclass

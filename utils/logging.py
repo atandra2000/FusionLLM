@@ -1,16 +1,12 @@
 # utils/logging.py
-"""Training metrics — W&B + MLflow dual logging; stdout is the tertiary sink.
+"""Training metrics — W&B logging; stdout is the tertiary sink.
 
 Identity
 --------
-* **W&B + MLflow is the only logging pair.**  Both are always on;
-  the trainer blocks on the slower of the two at the end of every
-  step (in practice MLflow is local-file and W&B is the bottleneck).
+* **W&B is the only logging backend.** 
 * Async log submissions via a small thread pool keep the trainer hot
   path off the network.
-* Histograms (MoE expert load) are submitted to both backends — the
-  MLflow side uses ``mlflow.log_metrics`` with the raw float, which
-  the MLflow UI will histogram if you ``enable_system_metrics``.
+* Histograms (MoE expert load) are submitted to W&B.
 """
 
 from __future__ import annotations
@@ -26,14 +22,7 @@ import torch
 
 class TrainerLogger:
     """
-    Logs training and validation metrics to **W&B (primary) and MLflow
-    (mirror)**, with stdout as the tertiary sink.
-
-    The two backends are configured independently.  W&B is the "primary"
-    UI (it has the cleanest per-step dashboards and the smoothest
-    collaboration story); MLflow is the "mirror" (it has the strongest
-    long-term artefact store and the best local-only mode for offline
-    ablation studies).
+    Logs training and validation metrics to **W&B**, with stdout as the tertiary sink.
     """
 
     def __init__(
@@ -46,19 +35,12 @@ class TrainerLogger:
         wandb_tags: list | None = None,
         wandb_config: dict[str, Any] | None = None,
         wandb_enabled: bool = True,
-        mlflow_tracking_uri: str | None = None,
-        mlflow_experiment_name: str | None = None,
-        mlflow_run_name: str | None = None,
-        mlflow_tags: dict | None = None,
-        mlflow_config: dict[str, Any] | None = None,
-        mlflow_enabled: bool = True,
         log_grad_norm: bool = True,
     ):
         self.log_interval = log_interval
         self.seq_len = seq_len
         self.log_grad_norm = log_grad_norm
         self.wandb_enabled = wandb_enabled
-        self.mlflow_enabled = mlflow_enabled
 
         self._start = time.time()
         self._step_start = time.time()
@@ -68,8 +50,6 @@ class TrainerLogger:
         self._ema_alpha: float = 0.1
 
         self._wandb = None
-        self._mlflow = None
-        self._mlflow_run = None
 
         self._async_executor = ThreadPoolExecutor(max_workers=4, thread_name_prefix="logger_async")
 
@@ -97,42 +77,6 @@ class TrainerLogger:
                 self.wandb_enabled = False
         elif wandb_enabled and not wandb_project:
             print("[logging] wandb.project not set — W&B disabled")
-
-        # ── MLflow ─────────────────────────────────────────────────────
-        if mlflow_enabled and mlflow_tracking_uri:
-            try:
-                import mlflow
-
-                mlflow.set_tracking_uri(mlflow_tracking_uri)
-                mlflow.set_experiment(mlflow_experiment_name or "default")
-                self._mlflow_run = mlflow.start_run(
-                    run_name=mlflow_run_name,
-                    tags=mlflow_tags or {},
-                )
-                if mlflow_config:
-                    mlflow.log_params(
-                        {
-                            k: v
-                            for k, v in mlflow_config.items()
-                            if isinstance(v, (str, int, float, bool))
-                        }
-                    )
-                self._mlflow = mlflow
-                print(
-                    f"[logging] MLflow run: {self._mlflow_run.info.run_id} "
-                    f"(uri={mlflow_tracking_uri}, exp={mlflow_experiment_name})"
-                )
-            except ImportError:
-                print("[logging] mlflow not installed — pip install mlflow")
-                self.mlflow_enabled = False
-            except Exception as exc:
-                print(f"[logging] MLflow init failed: {exc}")
-                self.mlflow_enabled = False
-        elif mlflow_enabled and not mlflow_tracking_uri:
-            print(
-                "[logging] mlflow.tracking_uri not set — MLflow disabled "
-                "(set training.mlflow_tracking_uri: file:./mlruns in the YAML)"
-            )
 
     def _gpu_stats(self) -> dict[str, float]:
         if not torch.cuda.is_available():
@@ -208,13 +152,6 @@ class TrainerLogger:
             else:
                 self._wandb.log(log_dict, step=step)
 
-        # ── MLflow ─────────────────────────────────────────────────────
-        if self._mlflow is not None:
-            try:
-                self._async_executor.submit(self._mlflow.log_metrics, log_dict, step=step)
-            except Exception as exc:
-                print(f"[logging] MLflow log_metrics failed at step {step}: {exc}")
-
         self._loss_window = []
         self._step_tokens = 0
         self._step_start = time.time()
@@ -247,11 +184,6 @@ class TrainerLogger:
 
         if self._wandb is not None:
             self._async_executor.submit(self._wandb.log, log_dict, step=step)
-        if self._mlflow is not None:
-            try:
-                self._async_executor.submit(self._mlflow.log_metrics, log_dict, step=step)
-            except Exception as exc:
-                print(f"[logging] MLflow val log failed at step {step}: {exc}")
 
     def log_moe_routing(self, step: int, layer_idx: int, stats: dict[str, torch.Tensor]) -> None:
         """Log per-expert load histograms (sparse step logging)."""
@@ -265,41 +197,16 @@ class TrainerLogger:
                 {f"moe/layer_{layer_idx}/expert_load": self._wandb.Histogram(load)},
                 step=step,
             )
-        if self._mlflow is not None:
-            try:
-                self._async_executor.submit(
-                    self._mlflow.log_metrics,
-                    {
-                        f"moe/layer_{layer_idx}/expert_load_mean": float(
-                            sum(load) / max(1, len(load))
-                        ),
-                        f"moe/layer_{layer_idx}/expert_load_max": float(max(load) or 0.0),
-                        f"moe/layer_{layer_idx}/expert_load_min": float(min(load) or 0.0),
-                    },
-                    step=step,
-                )
-            except Exception as exc:
-                print(f"[logging] MLflow MoE log failed at step {step}: {exc}")
 
     def log_artifact(self, local_path: str, artifact_path: str | None = None) -> None:
-        """Upload a file artefact to both W&B and MLflow (rank-0 only)."""
+        """Upload a file artefact to W&B (rank-0 only)."""
         if self._wandb is not None:
             self._async_executor.submit(self._wandb.log_artifact, local_path, artifact_path)
-        if self._mlflow is not None:
-            try:
-                self._async_executor.submit(self._mlflow.log_artifact, local_path, artifact_path)
-            except Exception as exc:
-                print(f"[logging] MLflow log_artifact failed for {local_path}: {exc}")
 
     def log_summary(self, summary: dict[str, Any]) -> None:
         if self._wandb is not None and self._wandb.run is not None:
             for k, v in summary.items():
                 self._wandb.run.summary[k] = v
-        if self._mlflow is not None and self._mlflow_run is not None:
-            try:
-                self._async_executor.submit(self._mlflow.log_metrics, summary)
-            except Exception as exc:
-                print(f"[logging] MLflow log_summary failed: {exc}")
 
     def save_log(self, filename: str, data: dict) -> None:
         with open(filename, "a", encoding="utf-8") as f:
@@ -310,11 +217,6 @@ class TrainerLogger:
             self._async_executor.shutdown(wait=True)
         if self._wandb is not None:
             self._wandb.finish()
-        if self._mlflow is not None and self._mlflow_run is not None:
-            try:
-                self._mlflow.end_run()
-            except Exception:
-                pass
 
 
 _logger: TrainerLogger | None = None
@@ -331,12 +233,6 @@ def init_logging(
     wandb_tags: list | None = None,
     wandb_config: dict[str, Any] | None = None,
     wandb_enabled: bool = True,
-    mlflow_tracking_uri: str | None = None,
-    mlflow_experiment_name: str | None = None,
-    mlflow_run_name: str | None = None,
-    mlflow_tags: dict | None = None,
-    mlflow_config: dict[str, Any] | None = None,
-    mlflow_enabled: bool = True,
     log_grad_norm: bool = True,
 ) -> None:
     """Module-level initialiser (called by the trainer once)."""
@@ -351,12 +247,6 @@ def init_logging(
         wandb_tags=wandb_tags,
         wandb_config=wandb_config,
         wandb_enabled=wandb_enabled,
-        mlflow_tracking_uri=mlflow_tracking_uri,
-        mlflow_experiment_name=mlflow_experiment_name,
-        mlflow_run_name=mlflow_run_name,
-        mlflow_tags=mlflow_tags,
-        mlflow_config=mlflow_config,
-        mlflow_enabled=mlflow_enabled,
         log_grad_norm=log_grad_norm,
     )
 

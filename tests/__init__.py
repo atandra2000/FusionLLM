@@ -12,7 +12,7 @@ Layout (one file per architectural unit, per `plan.md:0.3`):
 * test_transformer.py — schedule parser + block dispatcher (the smoke)
 * test_distributed.py — FSDP2 helpers: strategy enum, single-GPU no-op
 * test_checkpoint.py  — CheckpointManager atomic save/load
-* test_logging.py     — TrainerLogger W&B/MLflow shim
+* test_logging.py     — TrainerLogger W&B shim
 * test_eval.py        — eval_core.run_perplexity
 
 Tests are CPU-only by default. GPU-marked tests live behind

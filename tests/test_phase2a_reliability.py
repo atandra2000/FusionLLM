@@ -373,7 +373,6 @@ def test_metrics_in_logger():
         logger = TrainerLogger(
             log_interval=1,
             wandb_enabled=False,
-            mlflow_enabled=False,
         )
 
         # Log with all new metrics

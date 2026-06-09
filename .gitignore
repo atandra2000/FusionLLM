@@ -76,15 +76,17 @@ benchmark_results/
 
 # Development tools (local only)
 .opencode/
-.opencode/**
+opencode.json
+.opencode/
+
+# Graphify/analysis tools (local only)
 graphify-out/
-graphify-out/**
 .graphifyignore
 .graphify/
-.graphify/**
+
+# Documentation files (local only)
 instruction.md
 study_sources.md
 
-# Test files (can be added back if needed)
+# Test suite (development only)
 tests/
-tests/**

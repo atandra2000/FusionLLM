@@ -10,16 +10,24 @@ opencode.json
 # Test suite (development only)
 tests/
 
-# Internal documentation (audit, plans, etc - should be removed from GitHub)
+# Internal documentation (removed before pre-training)
 TECHNICAL_AUDIT.md
 IMPLEMENTATION_CHECKLIST.md
 UPGRADE_PLAN.md
 EXECUTIVE_SUMMARY.md
 AGENTS.md
+CLEANUP_AUDIT.md
 
-# Study and instruction files
+# Study and instruction files (removed before pre-training)
 instruction.md
 study_sources.md
+
+# Dev-only scripts and configs (removed before pre-training)
+benchmarks/
+scripts/bench_mla.py
+scripts/run_smoke*.sh
+configs/smoke_pretrain.yaml
+upgrade.sh
 
 # Python cache
 __pycache__/

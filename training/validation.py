@@ -1,107 +1,103 @@
 # training/validation.py
-"""Evaluation logic for the training pipeline.
+"""Validation and evaluation (Frozen v1 spec).
 
-Handles perplexity evaluation and task-based evaluation during training.
+Per FINAL_FROZEN_SPEC.md §2:
+  - eval_enabled: true
+  - eval_interval_steps: 5000
+  - eval_max_batches: 8
+  - eval_synthetic: true (uses synthetic data for validation perplexity)
 """
 
 from __future__ import annotations
 
-from typing import TYPE_CHECKING
-
-from utils.distributed import is_main_process
-
-if TYPE_CHECKING:
-    import torch
-    from training.configs import EvalConfig
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
 
 
-def maybe_eval(
-    step: int,
-    eval_cfg: EvalConfig,
-    raw_model: torch.nn.Module,
-    device: torch.device,
-    logger,
-    runs_csv,
-    log_fn,
-) -> None:
-    """Run evaluation if enabled and at the right step.
+def generate_synthetic_batch(
+    batch_size: int,
+    seq_len: int,
+    vocab_size: int,
+    device: torch.device = torch.device("cpu"),
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Generate a synthetic batch of tokens for validation."""
+    tokens = torch.randint(0, vocab_size, (batch_size, seq_len), device=device)
+    targets = torch.randint(0, vocab_size, (batch_size, seq_len), device=device)
+    return tokens, targets
+
+
+@torch.no_grad()
+def compute_validation_loss(
+    model: nn.Module,
+    batch_size: int = 2,
+    seq_len: int = 4096,
+    vocab_size: int = 64000,
+    num_batches: int = 8,
+    device: torch.device = torch.device("cpu"),
+) -> dict[str, float]:
+    """Compute validation loss and perplexity on synthetic data.
 
     Args:
-        step: Current training step
-        eval_cfg: Evaluation configuration
-        raw_model: The unwrapped model
-        device: Device for evaluation
-        logger: TrainerLogger for logging metrics
-        runs_csv: RunsCsvLogger for CSV logging
-        log_fn: Logging function for messages
+        model: The model (should be in eval mode).
+        batch_size: Micro batch size for validation.
+        seq_len: Sequence length.
+        vocab_size: Vocabulary size.
+        num_batches: Number of batches to average over.
+        device: Device to run on.
+
+    Returns:
+        dict with "loss" and "ppl".
     """
-    if not eval_cfg.eval_enabled:
-        return
-    if step <= 0 or step % eval_cfg.eval_interval != 0:
-        return
-    if not is_main_process():
-        return
+    model.eval()
+    total_loss = 0.0
+    total_tokens = 0
 
-    from eval.eval_core import make_synthetic_loader, run_perplexity
-
-    loader = make_synthetic_loader() if eval_cfg.eval_synthetic else None
-    ppl_metrics: dict[str, float] = {}
-    try:
-        ppl_metrics = run_perplexity(
-            raw_model,
-            loader,
-            device=str(device),
-            max_batches=eval_cfg.eval_max_batches,
-        )
-    except Exception as exc:
-        log_fn(f"[eval] step {step}: perplexity failed: {exc!r}")
-
-    if ppl_metrics:
-        log_fn(
-            f"[eval] step={step} val_loss={ppl_metrics['loss']:.4f} "
-            f"val_ppl={ppl_metrics['ppl']:.2f} n_tokens={int(ppl_metrics['n_tokens'])}"
+    for _ in range(num_batches):
+        tokens, targets = generate_synthetic_batch(
+            batch_size, seq_len, vocab_size, device
         )
 
-    eval_task_metrics: dict[str, float] = {}
-    if not eval_cfg.eval_synthetic:
-        from eval.run_lm_eval import run_lm_eval
+        logits = model(tokens)  # (B, T, V)
 
-        try:
-            task_results = run_lm_eval(
-                raw_model,
-                tasks=eval_cfg.eval_tasks,
-                device=str(device),
-                limit=50,
-            )
-            if task_results is not None:
-                for task_name, score in task_results.items():
-                    log_fn(f"[eval]   {task_name}: {score:.4f}")
-                    eval_task_metrics[task_name] = score
-        except Exception as exc:
-            log_fn(f"[eval] step {step}: lm_eval failed: {exc!r}")
-
-    val_metrics = dict(ppl_metrics)
-    val_metrics.pop("n_tokens", None)
-    val_metrics.update(eval_task_metrics)
-    if val_metrics:
-        try:
-            logger.log_validation(
-                step,
-                ppl_metrics.get("loss", 0.0),
-                val_metrics=val_metrics,
-            )
-        except Exception as exc:
-            log_fn(f"[eval] step {step}: logger rejected metrics: {exc!r}")
-
-    try:
-        runs_csv.log(
-            step,
-            loss=ppl_metrics.get("loss", 0.0),
-            ppl=ppl_metrics.get("ppl", 0.0),
-            **eval_task_metrics,
+        loss = F.cross_entropy(
+            logits.view(-1, vocab_size),
+            targets.view(-1),
+            reduction="sum",
         )
-    except Exception as exc:
-        log_fn(f"[eval] step {step}: runs.csv failed: {exc!r}")
+        total_loss += loss.item()
+        total_tokens += batch_size * seq_len
+
+    avg_loss = total_loss / total_tokens
+    ppl = torch.exp(torch.tensor(avg_loss)).item()
+
+    model.train()
+
+    return {
+        "loss": avg_loss,
+        "ppl": ppl,
+        "n_tokens": total_tokens,
+    }
 
 
-__all__ = ["maybe_eval"]
+@torch.no_grad()
+def validate_forward_shape(
+    model: nn.Module,
+    batch_size: int = 2,
+    seq_len: int = 4096,
+    device: torch.device = torch.device("cpu"),
+) -> None:
+    """Validate that forward pass produces correct output shape.
+
+    Raises AssertionError on mismatch.
+    """
+    model.eval()
+    tokens = torch.randint(0, 64000, (batch_size, seq_len), device=device)
+    logits = model(tokens)
+
+    expected_shape = (batch_size, seq_len, 64000)
+    assert logits.shape == expected_shape, \
+        f"Expected shape {expected_shape}, got {logits.shape}"
+
+    model.train()
+    print(f"[validation] Forward shape OK: {logits.shape}")

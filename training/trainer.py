@@ -1,421 +1,415 @@
 # training/trainer.py
-"""Pretrainer orchestration layer.
+"""Pre-training loop (Frozen v1 spec).
 
-This module provides the Pretrainer class that orchestrates the training
-loop using the decomposed modules. It delegates to:
-- training.configs for configuration
-- training.optimization for optimizer setup
-- training.train_step for forward/backward/optimizer step
-- training.validation for evaluation
-- training.checkpointing for save/load
-- training.curriculum_manager for curriculum learning
-- training.monitoring for health monitoring
+Orchestrates:
+  - Model forward/backward
+  - Gradient checkpointing
+  - NorMuon + CautiousAdamW optimizers
+  - WSD scheduler
+  - MoE gate bias update
+  - MTP loss computation
+  - W&B logging
+  - Checkpoint save/load
+  - Validation
+
+Frozen v1 spec per FINAL_FROZEN_SPEC.md §2:
+  - micro_batch_size: 2
+  - gradient_accumulation_steps: 16
+  - total_steps: 63,400
+  - dtype: bf16
+  - use_checkpoint: true
+  - log_interval_steps: 50
+  - save_interval_steps: 2000
+  - eval_interval_steps: 5000
 """
 
 from __future__ import annotations
 
-import contextlib
+import math
 import os
-import sys
-from dataclasses import asdict
+import time
 from pathlib import Path
-from typing import Iterator
+from typing import Any
 
 import torch
-from torch.utils.data import DataLoader
-from tqdm import tqdm
+import torch.nn as nn
+import torch.nn.functional as F
 
-sys.path.append(str(Path(__file__).parent.parent))
-
-from data.async_loader import AsyncShardLoader
+from models.fusionllm import FusionLLM
 from models.mtp import MultiTokenPrediction
-from models.transformer import Transformer, count_parameters
-from training.configs import ConfigBundle
-from training.checkpointing import find_latest_checkpoint, load_checkpoint, save_checkpoint
-from training.curriculum_manager import advance_curriculum, init_curriculum
-from training.dataset import PretrainDataset
-from training.numerical_health import init_health_monitor, init_runs_csv, register_spike_callback
-from training.optimization import build_optimizers
-from training.schedules import BatchSizeSchedule, SeqLenSchedule
-from training.train_step import train_step
-from training.validation import maybe_eval
-from training.wsd import WSDScheduler
-from utils.checkpoint import CheckpointManager
-from utils.distributed import (
-    configure_reshard,
-    setup_distributed,
-    wrap_fsdp2,
-)
-from utils.logging import get_logger, init_logging
+from training.optimizer import NorMuon, CautiousAdamW, build_optimizers
+from training.scheduler import WSDScheduler
+from training.checkpoint import save_checkpoint, load_checkpoint, find_latest_checkpoint
+from training.validation import compute_validation_loss
 
 
-class Pretrainer:
-    """FSDP2-aware pre-training loop (v2 — accepts :class:`ConfigBundle`)."""
+class Trainer:
+    """Pre-training orchestrator for FusionLLM-v1.
 
-    def __init__(self, config: ConfigBundle):
-        self.cfg = config
-        self.world_size, self.rank, self.local_rank = setup_distributed()
+    Single-GPU training (A100 80GB). Pure PyTorch, BF16 autocast.
+    """
 
-        torch.cuda.set_device(self.local_rank)
-        self.device = torch.device(f"cuda:{self.local_rank}")
+    def __init__(self, config: dict):
+        self.config = config
+        self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+        self.dtype = torch.bfloat16 if config.get("dtype", "bf16") == "bf16" else torch.float32
 
-        log_cfg = config.logging
-        data_cfg = config.data
-        init_logging(
-            self.rank,
-            self.world_size,
-            log_interval=log_cfg.log_every,
-            seq_len=data_cfg.max_seq_len,
-            wandb_project=log_cfg.wandb_project,
-            wandb_entity=log_cfg.wandb_entity,
-            wandb_run_name=log_cfg.wandb_run_name,
-            wandb_tags=log_cfg.wandb_tags,
-            wandb_config=asdict(config),
-            wandb_enabled=log_cfg.wandb_enabled,
-        )
-        self.logger = get_logger()
+        # ── Model ─────────────────────────────────────────────────────────
+        self.model = FusionLLM(config).to(self.device)
+        self.use_checkpoint = config.get("use_checkpoint", True)
+        self._log(f"Model built: {self._count_params():,} total params")
 
-        self._log(f"Rank {self.rank}: initialising model...")
-        raw_model = Transformer(
-            config.model,
-            world_size=self.world_size,
-            rank=self.rank,
-            use_checkpoint=config.use_checkpoint,
-        ).to(self.device)
-
-        total, trainable = count_parameters(raw_model)
-        self._log(f"Parameters: {total:,} total / {trainable:,} trainable")
-
-        # Optional MTP wrapper (shares main_model.embed and main_model.head).
-        if getattr(raw_model, "embed", None) is not None and config.mtp_depth > 0:
-            raw_model_config = dict(config.model)
-            raw_model_config["mtp_depth"] = config.mtp_depth
-            raw_model_config["mtp_loss_weight"] = config.mtp_loss_weight
-            self.mtp = MultiTokenPrediction(raw_model_config, main_model=raw_model).to(self.device)
-            self._log(f"MTP enabled: depth={config.mtp_depth}, weight={config.mtp_loss_weight}")
+        # ── MTP ──────────────────────────────────────────────────────────
+        mtp_depth = config.get("mtp_depth", 2)
+        if mtp_depth > 0:
+            self.mtp = MultiTokenPrediction(config, self.model).to(self.device)
+            self._log(f"MTP enabled: depth={mtp_depth}")
         else:
             self.mtp = None
 
-        # ── FSDP2 wrap ──────────────────────────────────────────────────
-        _param_dtype_map: dict[str, torch.dtype] = {
-            "bf16": torch.bfloat16,
-            "fp16": torch.float16,
-            "fp32": torch.float32,
-        }
-        param_dtype = _param_dtype_map.get(config.fsdp_param_dtype, torch.bfloat16)
-        reduce_dtype = {
-            "bf16": torch.bfloat16,
-            "fp16": torch.float16,
-            "fp32": torch.float32,
-        }.get(config.fsdp_reduce_dtype, torch.float32)
-
-        wrapped = wrap_fsdp2(
-            self.mtp if self.mtp is not None else raw_model,
-            param_dtype=param_dtype,
-            reduce_dtype=reduce_dtype,
-            fsdp_shard_strategy=config.fsdp_shard_strategy,
-            fsdp_forward_prefetch=config.fsdp_forward_prefetch,
-            fsdp_backward_prefetch=config.fsdp_backward_prefetch,
-            limit_all_gathers=config.fsdp_limit_all_gathers,
-        )
-        if self.mtp is not None:
-            self.mtp = wrapped
-        else:
-            self.raw_model = raw_model
-        self.model = wrapped
-
-        if self.mtp is not None and not hasattr(self, "raw_model"):
-            self.raw_model = self.mtp.main_model
-
-        # ── Optimizers (Muon/NorMuon + CautiousAdamW) ────────────────────
-        self.muon, self.adamw = build_optimizers(self.raw_model, config)
-
-        schedule_cfg = config.schedule
-        optim_cfg = config.optim
-        if optim_cfg.scheduler == "wsd":
-            self.scheduler = WSDScheduler(
-                self.adamw,
-                total_steps=schedule_cfg.max_steps,
-                warmup_frac=optim_cfg.wsd_warmup_frac,
-                stable_frac=optim_cfg.wsd_stable_frac,
-                min_lr_ratio=optim_cfg.min_lr_ratio,
-                decay=optim_cfg.wsd_decay,
-            )
-        else:
-            from training.optimization import WarmupCosineDecayScheduler
-            self.scheduler = WarmupCosineDecayScheduler(
-                self.adamw,
-                warmup_steps=schedule_cfg.warmup_steps,
-                total_steps=schedule_cfg.max_steps,
-                min_lr_ratio=optim_cfg.min_lr_ratio,
-            )
-
-        self.batch_size_schedule = (
-            BatchSizeSchedule(
-                initial_batch_size=schedule_cfg.initial_batch_size,
-                final_batch_size=schedule_cfg.final_batch_size,
-                schedule_steps=schedule_cfg.batch_size_schedule_steps,
-            )
-            if schedule_cfg.batch_size_schedule_enabled
-            else None
-        )
-        self.seq_len_schedule = (
-            SeqLenSchedule(
-                initial_seq_len=schedule_cfg.initial_seq_len,
-                final_seq_len=schedule_cfg.final_seq_len,
-                schedule_steps=schedule_cfg.seq_len_schedule_steps,
-            )
-            if schedule_cfg.seq_len_schedule_enabled
-            else None
+        # ── Optimizers ───────────────────────────────────────────────────
+        train_model = self.mtp if self.mtp is not None else self.model
+        self.muon_opt, self.adamw_opt = build_optimizers(
+            train_model,
+            adamw_lr=config.get("lr", 3e-4),
+            muon_lr=config.get("muon_lr", 0.02),
+            muon_momentum=config.get("muon_momentum", 0.95),
+            adamw_betas=tuple(config.get("adamw_betas", [0.9, 0.95])),
+            weight_decay=config.get("weight_decay", 0.1),
+            cautious_wd=config.get("cautious_wd", True),
         )
 
-        self.amp_dtype = (
-            torch.bfloat16
-            if config.dtype == "bf16"
-            else torch.float16
-            if config.dtype == "fp16"
-            else None
+        # ── Scheduler ────────────────────────────────────────────────────
+        total_steps = config.get("total_steps", 63400)
+        warmup_frac = config.get("wsd_warmup_frac", 0.01)
+        stable_frac = config.get("wsd_stable_frac", 0.84)
+        min_lr_ratio = config.get("min_lr_ratio", 0.1)
+
+        # Scheduler for primary optimizer (AdamW)
+        adamw_opt_for_sched = self.adamw_opt
+        self.scheduler = WSDScheduler(
+            adamw_opt_for_sched,
+            total_steps=total_steps,
+            warmup_frac=warmup_frac,
+            stable_frac=stable_frac,
+            min_lr_ratio=min_lr_ratio,
+            decay=config.get("wsd_decay", "linear"),
         )
 
+        # ── Training state ───────────────────────────────────────────────
+        self.step = 0
+        self.global_step = 0
+        self.token_count = 0
+        self.best_loss = float("inf")
+        self.grad_accum_steps = config.get("gradient_accumulation_steps", 16)
+        self.micro_batch_size = config.get("micro_batch_size", 2)
+        self.max_seq_len = config.get("max_seq_len", 4096)
+        self.vocab_size = config.get("vocab_size", 64000)
+        self.grad_clip = config.get("grad_clip", 1.0)
+        self.balance_loss_alpha = config.get("balance_loss_alpha", 1e-4)
+        self.bias_update_speed = config.get("bias_update_speed", 1e-3)
+        self.bias_update_every = config.get("bias_update_every", 10)
+        self.save_dir = config.get("save_dir", "checkpoints/pretrain")
+        self.save_interval = config.get("save_interval_steps", 2000)
+        self.log_interval = config.get("log_interval_steps", 50)
+        self.eval_interval = config.get("eval_interval_steps", 5000)
+        self.max_keep = config.get("save_max_keep", 3)
+        self.loss_spike_threshold = config.get("loss_spike_threshold", 3.0)
+        self.grad_norm_threshold = config.get("grad_norm_threshold", 10.0)
+        self.loss_nan_skip = config.get("loss_nan_skip", True)
+        self.empty_cache_every = config.get("empty_cache_every", 100)
+
+        # WandB
+        self.wandb_enabled = config.get("wandb_enabled", True) and self.device.type == "cuda"
+        self.wandb_run = None
+        self._init_wandb()
+
+        # Gradient scaler (disabled for BF16)
         self.scaler = torch.amp.GradScaler("cuda", enabled=False)
 
-        configure_reshard(self.model, keep_last_n=config.shard_keep_last)
-
-        ckpt_cfg = config.checkpoint
-        self.ckpt_manager = CheckpointManager(
-            ckpt_cfg.checkpoint_dir,
-            checkpoint_backend=ckpt_cfg.checkpoint_backend,
-        )
-        self._opt_steps: int = 0
-        self._last_grad_norm: float = 0.0
-
-        # ── Curriculum (Phase 6.3) ─────────────────────────────────────
-        self.curriculum = init_curriculum(config)
-
-        # ── runs.csv logger (Phase 6.2) ────────────────────────────────
-        self._runs_csv = init_runs_csv()
-
-        # ── Numerical health monitor ──────────────────────────────────
-        self.health_monitor = init_health_monitor(config)
-        register_spike_callback(
-            self.health_monitor,
-            save_fn=self.save_checkpoint,
-            log_fn=self._log,
-        )
-
     def _log(self, msg: str) -> None:
-        if self.rank == 0:
-            print(msg)
+        print(f"[trainer] {msg}")
 
-    def _amp_context(self):
-        if self.amp_dtype is not None:
-            return torch.amp.autocast("cuda", dtype=self.amp_dtype)
-        return contextlib.nullcontext()
+    def _count_params(self) -> int:
+        return sum(p.numel() for p in self.model.parameters() if p.requires_grad)
 
-    def _maybe_eval(self, step: int) -> None:
-        maybe_eval(
-            step,
-            self.cfg.eval,
-            self.raw_model,
-            self.device,
-            self.logger,
-            self._runs_csv,
-            self._log,
-        )
+    def _init_wandb(self) -> None:
+        if not self.wandb_enabled:
+            return
+        try:
+            import wandb
+            self.wandb_run = wandb.init(
+                project=self.config.get("wandb_project", "fusionllm-v1"),
+                config=self.config,
+                tags=self.config.get("wandb_tags", ["v1-frozen", "single-gpu", "pure-pytorch"]),
+                reinit=True,
+            )
+        except Exception as e:
+            self._log(f"WandB init failed: {e}")
+            self.wandb_enabled = False
 
-    def _update_schedules(self, step: int) -> None:
-        data_cfg = self.cfg.data
-        loader = getattr(self, "_loader", None)
-        if self.batch_size_schedule is not None:
-            target_bs = self.batch_size_schedule.get_batch_size(step)
-            if target_bs != data_cfg.batch_size:
-                self._log(f"[sched] batch_size {data_cfg.batch_size} -> {target_bs}")
-                data_cfg.batch_size = target_bs
-                if loader is not None and hasattr(loader, "set_batch_size"):
-                    loader.set_batch_size(target_bs)
-        if self.seq_len_schedule is not None:
-            target_sl = self.seq_len_schedule.get_seq_len(step)
-            if target_sl != data_cfg.max_seq_len:
-                self._log(f"[sched] max_seq_len {data_cfg.max_seq_len} -> {target_sl}")
-                data_cfg.max_seq_len = target_sl
-                if loader is not None and hasattr(loader, "set_seq_len"):
-                    loader.set_seq_len(target_sl)
+    def _log_metrics(self, metrics: dict[str, float], step: int) -> None:
+        if self.wandb_enabled and self.wandb_run is not None:
+            try:
+                import wandb
+                wandb.log(metrics, step=step)
+            except Exception:
+                pass
+
+    def _get_train_model(self) -> nn.Module:
+        return self.mtp if self.mtp is not None else self.model
+
+    def _get_moe_layers(self):
+        """Get all MoE layers for bias update."""
+        return self.model.get_moe_layers()
 
     def train_step(
-        self, tokens: torch.Tensor, targets: torch.Tensor, micro_step: int
+        self,
+        tokens: torch.Tensor,
+        targets: torch.Tensor,
     ) -> dict[str, float]:
-        return train_step(
-            model=self.model,
-            mtp=self.mtp,
-            raw_model=self.raw_model,
-            tokens=tokens,
-            targets=targets,
-            micro_step=micro_step,
-            cfg=self.cfg,
-            muon=self.muon,
-            adamw=self.adamw,
-            scaler=self.scaler,
-            scheduler=self.scheduler,
-            health_monitor=self.health_monitor,
-            device=self.device,
-            rank=self.rank,
-            amp_context=self._amp_context(),
-        )
+        """Single training step (micro batch).
 
-    def save_checkpoint(self, step: int, tag: str = "") -> None:
-        save_checkpoint(
-            step=step,
-            tag=tag,
-            cfg=self.cfg,
-            ckpt_manager=self.ckpt_manager,
-            model=self.model,
-            raw_model=self.raw_model,
-            adamw=self.adamw,
-            muon=self.muon,
-            scheduler=self.scheduler,
-            curriculum=self.curriculum,
-            opt_steps=self._opt_steps,
-            world_size=self.world_size,
-            rank=self.rank,
-            log_fn=self._log,
-        )
+        Args:
+            tokens: (B, T) input token IDs.
+            targets: (B, T) target token IDs.
 
-    def load_checkpoint(self, step: int) -> int:
-        resumed_step, opt_steps = load_checkpoint(
-            step=step,
-            cfg=self.cfg,
-            ckpt_manager=self.ckpt_manager,
-            model=self.model,
-            raw_model=self.raw_model,
-            adamw=self.adamw,
-            muon=self.muon,
-            scheduler=self.scheduler,
-            curriculum=self.curriculum,
-            device=str(self.device),
-            log_fn=self._log,
-        )
-        self._opt_steps = opt_steps
-        return resumed_step
+        Returns:
+            Dict of metrics.
+        """
+        train_model = self._get_train_model()
+        train_model.train()
 
-    def train(self) -> None:
-        data_cfg = self.cfg.data
-        schedule_cfg = self.cfg.schedule
-        log_cfg = self.cfg.logging
+        tokens = tokens.to(self.device)
+        targets = targets.to(self.device)
 
-        iterate_loader: Iterator[tuple[torch.Tensor, torch.Tensor]]
-        if data_cfg.shard_manifest_path and os.path.isdir(
-            os.path.dirname(data_cfg.shard_manifest_path)
-        ):
-            loader = AsyncShardLoader(
-                manifest_path=Path(data_cfg.shard_manifest_path),
-                batch_size=data_cfg.batch_size,
-                grad_accum=data_cfg.gradient_accumulation_steps,
-                seqlen=data_cfg.max_seq_len,
-                rank=self.rank,
-                world_size=self.world_size,
-                micro_prefetch=8,
-                async_mode=torch.cuda.is_available(),
-            )
-            loader.start()
-            iterate_loader = loader
+        # ── Forward pass (with optional gradient checkpointing) ──────────
+        if self.use_checkpoint:
+            def _forward(t, tgt):
+                if self.mtp is not None:
+                    main_logits, mtp_outputs = self.mtp(t)
+                    main_loss = F.cross_entropy(
+                        main_logits.view(-1, self.vocab_size),
+                        tgt.view(-1),
+                        reduction="mean",
+                    )
+                    mtp_loss = self.mtp.compute_mtp_loss(mtp_outputs)
+                    return main_loss + mtp_loss
+                else:
+                    logits = self.model(t)
+                    return F.cross_entropy(
+                        logits.view(-1, self.vocab_size),
+                        tgt.view(-1),
+                        reduction="mean",
+                    )
+
+            with torch.cuda.amp.autocast(dtype=self.dtype, enabled=(self.dtype == torch.bfloat16)):
+                loss = torch.utils.checkpoint.checkpoint(
+                    _forward, tokens, targets, use_reentrant=False
+                )
         else:
-            dataset = PretrainDataset(
-                data_cfg.data_path,
-                data_cfg.max_seq_len,
-                data_cfg.vocab_size,
-            )
-
-            if self.world_size > 1:
-                sampler = torch.utils.data.distributed.DistributedSampler(
-                    dataset,
-                    num_replicas=self.world_size,
-                    rank=self.rank,
-                    shuffle=True,
+            with torch.cuda.amp.autocast(dtype=self.dtype, enabled=(self.dtype == torch.bfloat16)):
+                main_logits, mtp_outputs = self.mtp(tokens) if self.mtp is not None else (self.model(tokens), [])
+                main_loss = F.cross_entropy(
+                    main_logits.view(-1, self.vocab_size),
+                    targets.view(-1),
+                    reduction="mean",
                 )
-            else:
-                sampler = None
+                if mtp_outputs:
+                    mtp_loss = self.mtp.compute_mtp_loss(mtp_outputs)
+                else:
+                    mtp_loss = torch.tensor(0.0, device=self.device)
+                loss = main_loss + mtp_loss
 
-            class _InfiniteIter:
-                def __init__(self, dl):
-                    self._dl = dl
-                    self._it = iter(dl)
+        # ── MoE load balance loss ────────────────────────────────────────
+        balance_loss = torch.tensor(0.0, device=self.device)
+        if self.balance_loss_alpha > 0:
+            for moe in self._get_moe_layers():
+                balance_loss = balance_loss + moe.get_load_balance_loss()
+            balance_loss = self.balance_loss_alpha * balance_loss
+            loss = loss + balance_loss
 
-                def __iter__(self):
-                    return self
+        # ── Backward ──────────────────────────────────────────────────────
+        self.scaler.scale(loss).backward()
 
-                def __next__(self):
-                    try:
-                        return next(self._it)
-                    except StopIteration:
-                        self._it = iter(self._dl)
-                        return next(self._it)
+        # ── Numerical health check ────────────────────────────────────────
+        loss_val = loss.item()
+        metrics = {
+            "loss": loss_val,
+            "main_loss": main_loss.item() if not isinstance(main_loss, torch.Tensor) or main_loss.dim() == 0 else main_loss.item(),
+            "balance_loss": balance_loss.item(),
+        }
 
-            loader = DataLoader(
-                dataset,
-                batch_size=data_cfg.batch_size,
-                sampler=sampler,
-                shuffle=(sampler is None),
-                num_workers=4,
-                pin_memory=True,
-                drop_last=True,
+        if self.loss_nan_skip and (math.isnan(loss_val) or math.isinf(loss_val)):
+            self._log(f"WARNING: NaN/Inf loss at step {self.step}, skipping")
+            self.scaler.update()
+            return metrics
+
+        return metrics
+
+    def optimizer_step(self) -> dict[str, float]:
+        """Complete the optimizer step (grad clip + optimizer + scheduler)."""
+        metrics = {}
+
+        # ── Gradient clipping ─────────────────────────────────────────────
+        if self.grad_clip > 0:
+            train_model = self._get_train_model()
+            grad_norm = torch.nn.utils.clip_grad_norm_(
+                train_model.parameters(), self.grad_clip
             )
-            iterate_loader = _InfiniteIter(loader)
+            metrics["grad_norm"] = grad_norm.item() if isinstance(grad_norm, torch.Tensor) else grad_norm
 
-        global_step = 0
-        latest = find_latest_checkpoint(self.ckpt_manager)
-        if latest is not None:
-            try:
-                global_step = self.load_checkpoint(latest)
-            except Exception as exc:
-                self._log(f"[warn] Could not load checkpoint: {exc}")
+            if grad_norm > self.grad_norm_threshold:
+                self._log(f"WARNING: Large grad norm {grad_norm:.2f} at step {self.step}")
 
-        self._log(
-            f"Training from step {global_step} to {schedule_cfg.max_steps} "
-            f"(world_size={self.world_size})"
+        # ── Optimizer step ────────────────────────────────────────────────
+        if self.muon_opt is not None:
+            self.muon_opt.step()
+        self.adamw_opt.step()
+        self.scaler.update()
+
+        # ── Zero gradients ────────────────────────────────────────────────
+        train_model = self._get_train_model()
+        train_model.zero_grad(set_to_none=True)
+
+        # ── MoE gate bias update (every bias_update_every steps) ──────────
+        if self.step % self.bias_update_every == 0 and self.step > 0:
+            for moe in self._get_moe_layers():
+                moe.update_gate_bias(speed=self.bias_update_speed)
+
+        # ── Scheduler step ────────────────────────────────────────────────
+        self.scheduler.step()
+        metrics["lr"] = self.scheduler.get_last_lr()[0]
+
+        self.step += 1
+        self.global_step += 1
+
+        # ── Empty cache periodically ──────────────────────────────────────
+        if self.empty_cache_every > 0 and self.step % self.empty_cache_every == 0:
+            torch.cuda.empty_cache()
+
+        return metrics
+
+    def save(self, tag: str = "") -> None:
+        """Save checkpoint."""
+        train_model = self._get_train_model()
+        save_checkpoint(
+            model=train_model,
+            muon_opt=self.muon_opt,
+            adamw_opt=self.adamw_opt,
+            scheduler=self.scheduler,
+            step=self.step,
+            token_count=self.token_count,
+            best_loss=self.best_loss,
+            save_dir=self.save_dir,
+            max_keep=self.max_keep,
+            tag=tag or f"step_{self.step}",
         )
-        self.model.train()
 
-        self._loader = loader
+    def load(self, load_dir: str | Path) -> int:
+        """Load checkpoint and return the restored step."""
+        train_model = self._get_train_model()
+        meta = load_checkpoint(
+            model=train_model,
+            muon_opt=self.muon_opt,
+            adamw_opt=self.adamw_opt,
+            scheduler=self.scheduler,
+            load_dir=load_dir,
+            device=str(self.device),
+        )
+        restored_step = meta.get("step", 0)
+        self.step = restored_step
+        self.global_step = restored_step
+        self.token_count = meta.get("token_count", 0)
+        self.best_loss = meta.get("best_loss", float("inf"))
+        self._log(f"Resumed from step {restored_step}")
+        return restored_step
 
-        pbar = tqdm(total=schedule_cfg.max_steps, disable=self.rank != 0, desc="train")
-        while global_step < schedule_cfg.max_steps:
-            advance_curriculum(self.curriculum, global_step, loader, self._log)
+    def train_epoch(
+        self,
+        data_iter,
+        total_steps: int | None = None,
+    ) -> None:
+        """Run training loop.
 
-            self._update_schedules(global_step)
-            tokens, targets = next(iterate_loader)
-            tokens = tokens.to(self.device, non_blocking=True)
-            targets = targets.to(self.device, non_blocking=True)
-            metrics = self.train_step(tokens, targets, global_step)
+        Args:
+            data_iter: Iterator yielding (tokens, targets) tensors.
+            total_steps: Maximum steps. Defaults to config total_steps.
+        """
+        if total_steps is None:
+            total_steps = self.config.get("total_steps", 63400)
 
-            if global_step % log_cfg.log_every == 0 and self.rank == 0:
-                lr = self.scheduler.get_last_lr()[0]
-                muon_lr = self.muon.param_groups[0]["lr"] if self.muon is not None else 0.0
-                self.logger.log(
-                    global_step,
-                    metrics["loss"],
-                    lr=lr,
-                    muon_lr=muon_lr,
-                    grad_norm=self._last_grad_norm,
-                    metrics={
-                        "balance_loss": metrics["balance_loss"],
-                        "z_loss": metrics["z_loss"],
-                    },
+        self._log(f"Starting training: {total_steps} steps, batch={self.grad_accum_steps}×{self.micro_batch_size}")
+        self._log(f"Effective batch size: {self.grad_accum_steps * self.micro_batch_size} seqs")
+        self._log(f"Tokens per step: {self.grad_accum_steps * self.micro_batch_size * self.max_seq_len}")
+
+        train_model = self._get_train_model()
+        t_start = time.time()
+
+        while self.step < total_steps:
+            # ── Gradient accumulation loop ────────────────────────────────
+            accum_loss = 0.0
+
+            for micro_step in range(self.grad_accum_steps):
+                tokens, targets = next(data_iter)
+                if tokens.size(0) != self.micro_batch_size:
+                    # Skip incomplete batch
+                    continue
+                metrics = self.train_step(tokens, targets)
+
+                # Scale loss for accumulation
+                loss = metrics["loss"] / self.grad_accum_steps
+                accum_loss += loss
+
+            # ── Optimizer step (after accumulation) ───────────────────────
+            opt_metrics = self.optimizer_step()
+            self.token_count += self.grad_accum_steps * self.micro_batch_size * self.max_seq_len
+
+            # ── Logging ──────────────────────────────────────────────────
+            if self.step % self.log_interval == 0:
+                elapsed = time.time() - t_start
+                tokens_per_sec = self.token_count / elapsed if elapsed > 0 else 0
+                log_metrics = {
+                    "loss": accum_loss / self.grad_accum_steps,
+                    "step": self.step,
+                    "lr": opt_metrics.get("lr", 0),
+                    "grad_norm": opt_metrics.get("grad_norm", 0),
+                    "tokens_per_sec": tokens_per_sec,
+                    "tokens_total": self.token_count,
+                    "elapsed_sec": elapsed,
+                }
+                log_str = (f"step={self.step}/{total_steps} "
+                           f"loss={log_metrics['loss']:.4f} "
+                           f"lr={log_metrics['lr']:.2e} "
+                           f"grad_norm={log_metrics['grad_norm']:.4f} "
+                           f"tok/s={tokens_per_sec:.0f}")
+                self._log(log_str)
+                self._log_metrics(log_metrics, self.step)
+
+            # ── Validation ────────────────────────────────────────────────
+            if self.eval_interval > 0 and self.step % self.eval_interval == 0:
+                val_metrics = compute_validation_loss(
+                    self.model,
+                    batch_size=self.micro_batch_size,
+                    seq_len=self.max_seq_len,
+                    vocab_size=self.vocab_size,
+                    num_batches=8,
+                    device=self.device,
                 )
-                if global_step % 200 == 0:
-                    for i, moe in enumerate(self.raw_model.moe_layers()):
-                        stats = moe.get_routing_stats()
-                        if stats:
-                            self.logger.log_moe_routing(global_step, i, stats)
-            if global_step % self.cfg.checkpoint.save_every == 0 and global_step > 0:
-                self.save_checkpoint(global_step)
-            self._maybe_eval(global_step)
-            global_step += 1
-            pbar.update(1)
+                val_metrics["step"] = self.step
+                self._log(f"Validation: loss={val_metrics['loss']:.4f}, ppl={val_metrics['ppl']:.2f}")
+                self._log_metrics(val_metrics, self.step)
+                if val_metrics["loss"] < self.best_loss:
+                    self.best_loss = val_metrics["loss"]
+                    self.save(tag="best")
 
-        pbar.close()
-        self.save_checkpoint(global_step, tag="final")
-        self._log("Training complete.")
-        self.logger.finish()
+            # ── Checkpoint ────────────────────────────────────────────────
+            if self.save_interval > 0 and self.step % self.save_interval == 0:
+                self.save()
 
+        # ── Final save ────────────────────────────────────────────────────
+        self.save(tag="final")
+        self._log(f"Training complete. {total_steps} steps, {self.token_count:,} tokens")
 
-__all__ = ["Pretrainer"]
+        if self.wandb_run is not None:
+            self.wandb_run.finish()

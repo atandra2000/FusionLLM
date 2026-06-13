@@ -1,46 +1,21 @@
 # training/__init__.py
-"""Public API for the training package."""
+"""FusionLLM-v1 training infrastructure."""
 
-from .configs import (
-    CheckpointConfig,
-    ConfigBundle,
-    DataConfig,
-    EvalConfig,
-    LoggingConfig,
-    OptimConfig,
-    ScheduleConfig,
-)
-from .dataset import PretrainDataset
-from .optimization import (
-    CautiousAdamW,
-    Muon,
-    WarmupCosineDecayScheduler,
-    _cautious_mask,
-    _zeropower_via_newtonschulz5,
-    build_optimizers,
-)
-from .pretrain import build_config_from_yaml
-from .trainer import Pretrainer
+from .optimizer import NorMuon, CautiousAdamW, build_optimizers
+from .scheduler import WSDScheduler
+from .checkpoint import save_checkpoint, load_checkpoint, find_latest_checkpoint
+from .validation import compute_validation_loss, validate_forward_shape
+from .trainer import Trainer
 
 __all__ = [
-    # Configuration
-    "ConfigBundle",
-    "DataConfig",
-    "OptimConfig",
-    "ScheduleConfig",
-    "EvalConfig",
-    "CheckpointConfig",
-    "LoggingConfig",
-    # Training
-    "Pretrainer",
-    "PretrainDataset",
-    # Optimization
-    "Muon",
+    "NorMuon",
     "CautiousAdamW",
-    "WarmupCosineDecayScheduler",
     "build_optimizers",
-    "_cautious_mask",
-    "_zeropower_via_newtonschulz5",
-    # Entrypoint
-    "build_config_from_yaml",
+    "WSDScheduler",
+    "save_checkpoint",
+    "load_checkpoint",
+    "find_latest_checkpoint",
+    "compute_validation_loss",
+    "validate_forward_shape",
+    "Trainer",
 ]

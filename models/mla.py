@@ -1,362 +1,215 @@
 # models/mla.py
-"""Multi-Head Latent Attention with GQA on top of the low-rank KV.
+"""Multi-Head Latent Attention (Frozen v1 spec).
 
-Three changes from standard MLA:
+Architecture (per FINAL_FROZEN_SPEC.md §5.2):
+  Input (B, T, 768)
+    ├─ wq_a: Linear(768→192) + RMSNorm(192) + wq_b: Linear(192→12×96=1152)
+    │         └─ Split: Q_nope (12, 64), Q_pe (12, 32) → RoPE(Q_pe)
+    ├─ wkv_a: Linear(768→128) → Split: KV_latent (96), K_pe (32) → RoPE(K_pe)
+    │         └─ RMSNorm(96) → wkv_b: Linear(96→8×128=1024)
+    │                    └─ Split: K_nope (8, 64), V (8, 64)
+    ├─ Absorption: Q_nope @ wkv_b_k  →  (B, T, 12, kv_lora_rank=96)
+    ├─ GQA expand K/V: 8 → 12 groups
+    ├─ Concat: Q = [Q_nope_proj, Q_pe], K = [KV_normed, K_pe]
+    ├─ QK-Norm: RMSNorm on Q and K (dim = kv_lora_rank + qk_rope_head_dim = 128)
+    ├─ SDPA (causal, no FA, no Triton)
+    └─ wo: Linear(768→768)
 
-* **GQA on top of MLA** (Llama 3, Qwen 2.5, Phi-4-mini pattern).  ``n_kv_groups``
-  query heads share a single K/V head; the cached latent is replicated
-  across the group.  The absorption trick still applies — ``wkv_b`` is
-  folded into ``q_nope`` so attention scores are computed against the
-  cached latent directly.  This gives the cache benefit of MLA (~10×
-  vs MHA) *and* the per-group sharing of GQA (additional 2–8×).
-* **Sliding window option** (``window`` config).  When set, only the
-  last ``window`` tokens contribute to attention.  Composes with global
-  attention in the layer schedule (Gemma 2 5:1 pattern).
-* **QK-norm always on** for training stability.
+Per-layer params: 1,155,616
 """
 
 from __future__ import annotations
-
-import math
 
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
-from kernels.flash_attn import flash_attention
 
-from .rope import RotaryEmbedding
+class RotaryEmbedding(nn.Module):
+    """Minimal RoPE module — no YaRN, no dynamic extend beyond max_seq_len."""
+
+    def __init__(self, head_dim: int, max_seq_len: int, theta: float = 10000.0):
+        super().__init__()
+        assert head_dim % 2 == 0, f"head_dim must be even, got {head_dim}"
+        self.head_dim = head_dim
+        self.max_seq_len = max_seq_len
+        inv_freq = 1.0 / (theta ** (torch.arange(0, head_dim, 2, dtype=torch.float32) / head_dim))
+        self.register_buffer("inv_freq", inv_freq, persistent=False)
+        self._cached_cos: torch.Tensor | None = None
+        self._cached_sin: torch.Tensor | None = None
+        self._cached_len: int = 0
+
+    def _build_cache(self, seq_len: int, device: torch.device) -> None:
+        if seq_len <= self._cached_len and self._cached_cos is not None and self._cached_cos.device == device:
+            return
+        t = torch.arange(seq_len, device=device, dtype=self.inv_freq.dtype)
+        freqs = torch.outer(t, self.inv_freq)
+        cos = freqs.cos().repeat_interleave(2, dim=-1)
+        sin = freqs.sin().repeat_interleave(2, dim=-1)
+        self._cached_cos = cos
+        self._cached_sin = sin
+        self._cached_len = seq_len
+
+    def forward(self, x: torch.Tensor, start_pos: int = 0) -> torch.Tensor:
+        """Apply RoPE. x: (..., seq_len, head_dim)."""
+        seq_len = x.size(-2)
+        device = x.device
+        self._build_cache(start_pos + seq_len, device)
+        cos = self._cached_cos[start_pos: start_pos + seq_len].to(x.dtype)
+        sin = self._cached_sin[start_pos: start_pos + seq_len].to(x.dtype)
+        # Reshape for broadcasting: (1, 1, seq_len, head_dim) for 4D, etc.
+        while cos.dim() < x.dim():
+            cos = cos.unsqueeze(0)
+            sin = sin.unsqueeze(0)
+        x_half = x.float().reshape(*x.shape[:-1], -1, 2)
+        x_rot = torch.stack([-x_half[..., 1], x_half[..., 0]], dim=-1).flatten(-2)
+        return (x * cos + x_rot * sin).to(x.dtype)
 
 
 class MultiHeadLatentAttention(nn.Module):
-    def __init__(
-        self,
-        config: dict,
-        layer_idx: int = 0,
-        world_size: int = 1,
-        rank: int = 0,
-    ):
+    """Multi-Head Latent Attention with GQA-on-top-of-MLA.
+
+    Frozen v1 spec — no sliding window, no flash attention, no Triton.
+    """
+
+    def __init__(self, config: dict, layer_idx: int = 0):
         super().__init__()
         self.layer_idx = layer_idx
-        self.world_size = world_size
-        self.rank = rank
 
-        # ── Dimensions ────────────────────────────────────────────────────
-        self.dim = config["dim"]
-        self.n_heads = config["n_heads"]
-        self.q_lora_rank = config["q_lora_rank"]
-        self.kv_lora_rank = config["kv_lora_rank"]
-        self.qk_nope_head_dim = config["qk_nope_head_dim"]
-        self.qk_rope_head_dim = config["qk_rope_head_dim"]
-        self.v_head_dim = config["v_head_dim"]
-        self.qk_head_dim = self.qk_nope_head_dim + self.qk_rope_head_dim
-        self.max_seq_len = config["max_seq_len"]
+        d = config["dim"]                          # 768
+        n_heads = config["n_heads"]                 # 12
+        n_kv_groups = config["n_kv_groups"]         # 8
+        self.n_heads = n_heads
+        self.n_kv_groups = n_kv_groups
 
-        # GQA-on-top-of-MLA: n_kv_groups query heads share one K/V head.
-        # n_kv_groups == n_heads   → MHA (original DeepSeek-V3)
-        # n_kv_groups == 1         → MQA (one KV head)
-        # n_kv_groups in-between  → GQA (Llama 3 / Qwen 2.5 / Phi-4-mini)
-        self.n_kv_groups = config.get("n_kv_groups", self.n_heads)
-        if self.n_heads % self.n_kv_groups != 0:
-            raise ValueError(
-                f"n_heads ({self.n_heads}) must be divisible by n_kv_groups ({self.n_kv_groups})"
-            )
-        if self.n_kv_groups % world_size != 0:
-            raise ValueError(
-                f"n_kv_groups ({self.n_kv_groups}) must be divisible by world_size ({world_size})"
-            )
-        self.q_per_kv = self.n_heads // self.n_kv_groups
-        self.n_local_heads = self.n_heads // world_size
-        self.n_local_kv_heads = self.n_kv_groups // world_size
+        self.q_lora_rank = config["q_lora_rank"]          # 192
+        self.kv_lora_rank = config["kv_lora_rank"]        # 96
+        self.qk_nope_head_dim = config["qk_nope_head_dim"]  # 64
+        self.qk_rope_head_dim = config["qk_rope_head_dim"]  # 32
+        self.v_head_dim = config["v_head_dim"]            # 64
+        self.qk_head_dim = self.qk_nope_head_dim + self.qk_rope_head_dim  # 96
+        self.max_seq_len = config["max_seq_len"]          # 4096
 
-        # Sliding window: None or 0 = global, else local attention over
-        # the last `window` tokens (Gemma 2 style).
-        self.window = config.get("sliding_window", None)
+        # ── Query low-rank projection ────────────────────────────────────
+        self.wq_a = nn.Linear(d, self.q_lora_rank, bias=False)       # 768→192
+        self.q_norm = nn.RMSNorm(self.q_lora_rank, eps=1e-6)         # 192
+        self.wq_b = nn.Linear(self.q_lora_rank, n_heads * self.qk_head_dim, bias=False)  # 192→1152
 
-        # ── RoPE & YaRN config ───────────────────────────────────────────
-        self.rope_theta = config.get("rope_theta", 10000.0)
-        self.rope_factor = config.get("rope_factor", 1.0)
-
-        mscale_raw = config.get("mscale", 1.0)
-        self.mscale = (
-            0.1 * mscale_raw * math.log(self.rope_factor) + 1.0
-            if self.rope_factor > 1.0
-            else mscale_raw
-        )
-
-        # ── Softmax scale ─────────────────────────────────────────────────
-        self.softmax_scale = self.qk_head_dim**-0.5
-        if self.max_seq_len > 4096 and self.mscale != 1.0:
-            self.softmax_scale *= self.mscale**2
-
-        # ── Query projections (latent) ────────────────────────────────────
-        if self.q_lora_rank > 0:
-            self.wq_a = nn.Linear(self.dim, self.q_lora_rank, bias=False)
-            self.q_norm = nn.RMSNorm(self.q_lora_rank, eps=1e-6)
-            self.wq_b = nn.Linear(
-                self.q_lora_rank,
-                self.n_local_heads * self.qk_head_dim,
-                bias=False,
-            )
-        else:
-            self.wq = nn.Linear(self.dim, self.n_local_heads * self.qk_head_dim, bias=False)
-
-        # ── KV projections with latent compression + GQA ──────────────────
-        # wkv_a always projects to (kv_lora_rank + qk_rope_head_dim); the
-        # latent is per-KV-group.  The wkv_b output is per-KV-group, then
-        # the q_per_kv factor is captured by the attention itself (q_nope
-        # has shape (n_local_heads, qk_nope_head_dim) and broadcasts).
-        self.wkv_a = nn.Linear(
-            self.dim,
-            self.kv_lora_rank + self.qk_rope_head_dim,
-            bias=False,
-        )
-        self.kv_norm = nn.RMSNorm(self.kv_lora_rank, eps=1e-6)
+        # ── KV latent compression ────────────────────────────────────────
+        self.wkv_a = nn.Linear(d, self.kv_lora_rank + self.qk_rope_head_dim, bias=False)  # 768→128
+        self.kv_norm = nn.RMSNorm(self.kv_lora_rank, eps=1e-6)        # 96
+        # wkv_b: (kv_lora_rank) → n_kv_groups × (qk_nope_head_dim + v_head_dim) = 8×128=1024
         self.wkv_b = nn.Linear(
             self.kv_lora_rank,
-            self.n_local_kv_heads * (self.qk_nope_head_dim + self.v_head_dim),
+            n_kv_groups * (self.qk_nope_head_dim + self.v_head_dim),
             bias=False,
         )
-        self.wo = nn.Linear(self.n_local_heads * self.v_head_dim, self.dim, bias=False)
 
-        # ── Cached wkv_b slices (non-persistent; rebuilt on demand) ─────
-        self.register_buffer(
-            "_wkv_b_k",
-            torch.empty(self.n_local_kv_heads, self.qk_nope_head_dim, self.kv_lora_rank),
-            persistent=False,
-        )
-        self.register_buffer(
-            "_wkv_b_v",
-            torch.empty(self.n_local_kv_heads, self.v_head_dim, self.kv_lora_rank),
-            persistent=False,
-        )
-        self._wkv_b_cached: bool = False
-        self._rebuild_wkv_b_cache()
-        self.wkv_b.weight.register_post_accumulate_grad_hook(
-            lambda _p: self._invalidate_wkv_b_cache()
-        )
+        # ── Output projection ────────────────────────────────────────────
+        self.wo = nn.Linear(n_heads * self.v_head_dim, d, bias=False)  # 768→768
 
-        # ── KV cache (for generation; training bypasses) ─────────────────
-        self._cache_batch: int = 0
-        self.kv_cache: torch.Tensor | None = None
-        self.pe_cache: torch.Tensor | None = None
+        # ── QK-Norm (applied to Q/K concat: dim = kv_lora_rank + qk_rope_head_dim) ──
+        self.qk_norm_dim = self.kv_lora_rank + self.qk_rope_head_dim  # 96+32=128
+        self.q_norm_qk = nn.RMSNorm(self.qk_norm_dim, eps=1e-6)
+        self.k_norm_qk = nn.RMSNorm(self.qk_norm_dim, eps=1e-6)
 
-        # ── RoPE frequency table (shared with GDN etc.) ──────────────────
+        # ── RoPE ─────────────────────────────────────────────────────────
         self.rope = RotaryEmbedding(
             head_dim=self.qk_rope_head_dim,
-            rope_theta=self.rope_theta,
-            rope_factor=self.rope_factor,
             max_seq_len=self.max_seq_len,
+            theta=config.get("rope_theta", 10000.0),
         )
 
-        # ── QK-norm (always on) ──────────────────────────────────────────
-        self.total_attn_dim = self.kv_lora_rank + self.qk_rope_head_dim
-        self.q_norm_qk = nn.RMSNorm(self.total_attn_dim, eps=1e-6)
-        self.k_norm_qk = nn.RMSNorm(self.total_attn_dim, eps=1e-6)
-
-    # ──────────────────────────────────────────────────────────────────────
-    # wkv_b cache helpers
-    # ──────────────────────────────────────────────────────────────────────
-
-    def _rebuild_wkv_b_cache(self) -> None:
-        w = self.wkv_b.weight.view(
-            self.n_local_kv_heads,
-            self.qk_nope_head_dim + self.v_head_dim,
-            self.kv_lora_rank,
-        )
-        self._wkv_b_k.copy_(w[:, : self.qk_nope_head_dim])  # type: ignore[operator]
-        self._wkv_b_v.copy_(w[:, self.qk_nope_head_dim :])  # type: ignore[operator]
-        self._wkv_b_cached = True
-
-    def _invalidate_wkv_b_cache(self) -> None:
-        self._wkv_b_cached = False
-
-    def _get_wkv_b(self):
-        if not self._wkv_b_cached:
-            self._rebuild_wkv_b_cache()
-        return self._wkv_b_k, self._wkv_b_v
-
-    # ──────────────────────────────────────────────────────────────────────
-    # RoPE helpers are in models.rope; MLA owns a `self.rope` instance
-    # ──────────────────────────────────────────────────────────────────────
-
-    # ──────────────────────────────────────────────────────────────────────
-    # Cache management (generation only)
-    # ──────────────────────────────────────────────────────────────────────
-
-    def _ensure_cache(self, bsz: int, device: torch.device, dtype: torch.dtype) -> None:
-        need_alloc = (
-            self.kv_cache is None
-            or bsz > self._cache_batch
-            or self.kv_cache.device != device
-            or self.kv_cache.dtype != dtype
-        )
-        if not need_alloc:
-            return
-        new_bsz = max(bsz, self._cache_batch * 2, 16)
-        self.kv_cache = torch.zeros(
-            new_bsz,
-            self.max_seq_len,
-            self.kv_lora_rank,
-            device=device,
-            dtype=dtype,
-        )
-        self.pe_cache = torch.zeros(
-            new_bsz,
-            self.max_seq_len,
-            self.qk_rope_head_dim,
-            device=device,
-            dtype=dtype,
-        )
-        self._cache_batch = new_bsz
-
-    def reset_cache(self) -> None:
-        del self.kv_cache
-        del self.pe_cache
-        self.kv_cache = None
-        self.pe_cache = None
-        self._cache_batch = 0
-
-    def prefill_cache(
-        self,
-        kv_latent: torch.Tensor,
-        k_pe: torch.Tensor,
-        start_pos: int,
-    ) -> None:
-        bsz, seqlen, _ = kv_latent.shape
-        end_pos = start_pos + seqlen
-        if end_pos > self.max_seq_len:
-            raise ValueError(f"prefill_cache: end_pos {end_pos} > max_seq_len {self.max_seq_len}")
-        self.rope.extend_to(end_pos, kv_latent.device)
-        self._ensure_cache(bsz, kv_latent.device, kv_latent.dtype)
-        self.kv_cache[:bsz, start_pos:end_pos] = kv_latent
-        self.pe_cache[:bsz, start_pos:end_pos] = k_pe
-
-    # ──────────────────────────────────────────────────────────────────────
-    # Forward
-    # ──────────────────────────────────────────────────────────────────────
+        # Precompute KV group → Q head mapping for GQA
+        # n_heads=12, n_kv_groups=8. 4 groups get 2 heads, 4 get 1 head.
+        base = n_heads // n_kv_groups
+        remainder = n_heads % n_kv_groups
+        kv_group_for_q = torch.zeros(n_heads, dtype=torch.long)
+        idx = 0
+        for g in range(n_kv_groups):
+            n_q = base + (1 if g < remainder else 0)
+            kv_group_for_q[idx: idx + n_q] = g
+            idx += n_q
+        self.register_buffer("_kv_group_for_q", kv_group_for_q, persistent=False)
 
     def forward(
         self,
         x: torch.Tensor,
         start_pos: int = 0,
         mask: torch.Tensor | None = None,
-        use_cache: bool = True,
     ) -> torch.Tensor:
-        bsz, seqlen, _ = x.shape
-        end_pos = start_pos + seqlen
-        if end_pos > self.max_seq_len:
-            raise RuntimeError(
-                f"Layer {self.layer_idx}: end_pos {end_pos} exceeds max_seq_len {self.max_seq_len}"
-            )
-        self.rope.extend_to(end_pos, x.device)
-        if use_cache:
-            self._ensure_cache(bsz, x.device, x.dtype)
+        B, T, _ = x.shape
+        device = x.device
+        n_heads = self.n_heads
+        n_kv_groups = self.n_kv_groups
+        kv_lora_rank = self.kv_lora_rank
 
-        # ── Queries ────────────────────────────────────────────────────────
-        if self.q_lora_rank > 0:
-            q = self.wq_b(self.q_norm(self.wq_a(x)))
-        else:
-            q = self.wq(x)
-        # (bsz, seqlen, n_local_heads, qk_head_dim)
-        q = q.view(bsz, seqlen, self.n_local_heads, self.qk_head_dim)
+        # ── 1. Query ─────────────────────────────────────────────────────
+        q = self.wq_b(self.q_norm(self.wq_a(x)))  # (B, T, n_heads * qk_head_dim)
+        q = q.view(B, T, n_heads, self.qk_head_dim)
         q_nope, q_pe = q.split([self.qk_nope_head_dim, self.qk_rope_head_dim], dim=-1)
-        q_pe = self.rope(q_pe, start_pos, seqlen)
+        q_pe = self.rope(q_pe, start_pos)  # (B, T, n_heads, qk_rope_head_dim)
 
-        # ── KV latent compression ──────────────────────────────────────────
-        kv_a = self.wkv_a(x)
-        kv_latent, k_pe_raw = kv_a.split([self.kv_lora_rank, self.qk_rope_head_dim], dim=-1)
-        kv_normed = self.kv_norm(kv_latent)
-        k_pe = self.rope(k_pe_raw.unsqueeze(2), start_pos, seqlen).squeeze(
-            2
-        )  # (bsz, seqlen, qk_rope_head_dim)
+        # ── 2. KV latent compression ─────────────────────────────────────
+        kv_a = self.wkv_a(x)  # (B, T, kv_lora_rank + qk_rope_head_dim)
+        kv_latent, k_pe_raw = kv_a.split([kv_lora_rank, self.qk_rope_head_dim], dim=-1)
+        kv_normed = self.kv_norm(kv_latent)  # (B, T, kv_lora_rank=96)
+        k_pe = self.rope(k_pe_raw.unsqueeze(-2), start_pos).squeeze(-2)  # (B, T, qk_rope_head_dim)
 
-        if use_cache:
-            self.kv_cache[:bsz, start_pos:end_pos] = kv_normed
-            self.pe_cache[:bsz, start_pos:end_pos] = k_pe
-            ctx_kv = self.kv_cache[:bsz, :end_pos]
-            ctx_pe = self.pe_cache[:bsz, :end_pos]
-        else:
-            ctx_kv = kv_normed
-            ctx_pe = k_pe
-
-        # ── Cached wkv_b slices (absorption trick) ─────────────────────────
-        wkv_b_k, wkv_b_v = self._get_wkv_b()  # (n_local_kv_heads, qk_nope/v_head_dim, kv_lora_rank)
-
-        # Project q_nope into the latent space.  GQA: replicate wkv_b_k
-        # across the q_per_kv group so that each Q head has its own
-        # absorbed-projection matrix, but the K/V head count is small.
-        # Shape: (n_local_heads, qk_nope_head_dim, kv_lora_rank)
-        if self.q_per_kv > 1:
-            wkv_b_k_full = wkv_b_k.repeat_interleave(self.q_per_kv, dim=0)
-            wkv_b_v_full = wkv_b_v.repeat_interleave(self.q_per_kv, dim=0)
-        else:
-            wkv_b_k_full = wkv_b_k
-            wkv_b_v_full = wkv_b_v
-
-        q_nope_proj = torch.einsum("bshd,hdc->bshc", q_nope, wkv_b_k_full)
-
-        # Expand context to per-head shape, replicating K/V across groups.
-        # ctx_kv/ctx_pe are (bsz, seqlen, dim) — unsqueeze(2) gives 4-d.
-        ctx_kv_exp = ctx_kv.unsqueeze(2).expand(-1, -1, self.n_local_heads, -1)
-        ctx_pe_exp = ctx_pe.unsqueeze(2).expand(-1, -1, self.n_local_heads, -1)
-        # q_pe is (bsz, seqlen, n_local_heads, head_dim) — no expand needed.
-
-        Q = torch.cat([q_nope_proj, q_pe], dim=-1)
-        K = torch.cat([ctx_kv_exp, ctx_pe_exp], dim=-1)
-        V = torch.einsum("bshc,hdc->bshd", ctx_kv_exp, wkv_b_v_full)
-
-        Q = self.q_norm_qk(Q)
-        K = self.k_norm_qk(K)
-
-        Q = Q.transpose(1, 2)
-        K = K.transpose(1, 2)
-        V = V.transpose(1, 2)
-
-        # ── Build attention mask (sliding window + causal) ─────────────────
-        attn_mask = self._build_attn_mask(bsz, seqlen, end_pos, mask, x.device)
-        attn_out = flash_attention(
-            Q,
-            K,
-            V,
-            attn_mask=attn_mask,
-            scale=self.softmax_scale,
+        # ── 3. Absorption trick ──────────────────────────────────────────
+        # wkv_b weight: (n_kv_groups * (qk_nope_head_dim + v_head_dim), kv_lora_rank)
+        # Reshape to (n_kv_groups, qk_nope_head_dim + v_head_dim, kv_lora_rank)
+        wkv_b_w = self.wkv_b.weight.view(
+            n_kv_groups,
+            self.qk_nope_head_dim + self.v_head_dim,
+            kv_lora_rank,
         )
-        out = attn_out.transpose(1, 2).contiguous().flatten(2)
-        return self.wo(out)
+        # Split into K and V parts
+        wkv_b_k = wkv_b_w[:, :self.qk_nope_head_dim, :]  # (8, 64, 96)  — produces K_nope
+        wkv_b_v = wkv_b_w[:, self.qk_nope_head_dim:, :]   # (8, 64, 96)  — produces V
 
-    def _build_attn_mask(
-        self,
-        bsz: int,
-        seqlen: int,
-        end_pos: int,
-        external_mask: torch.Tensor | None,
-        device: torch.device,
-    ) -> torch.Tensor | None:
-        """Compose (sliding window + causal) mask, optionally combine with
-        an externally supplied padding mask.  Returns a mask of shape
-        ``(bsz, 1, seqlen, end_pos)`` (or the same with more heads after
-        SDPA broadcasts it).
-        """
-        if self.window is None or self.window <= 0:
-            base = external_mask
-        else:
-            window = min(self.window, end_pos)
-            i = torch.arange(end_pos, device=device)
-            j = torch.arange(end_pos, device=device)
-            causal_keep = j[None, :] <= i[:, None]  # (end_pos, end_pos)
-            window_keep = j[None, :] >= i[:, None] - (window - 1)  # (end_pos, end_pos)
-            local = torch.where(causal_keep & window_keep, 0.0, float("-inf"))
-            local = local[-seqlen:, :]  # (seqlen, end_pos)
-            if external_mask is not None:
-                # external_mask: (1, 1, seqlen, end_pos) additive
-                local = local.unsqueeze(0).unsqueeze(0) + external_mask
-            else:
-                local = local.unsqueeze(0).unsqueeze(0)  # (1, 1, seqlen, end_pos)
-            base = local
+        # For absorption: project Q_nope through wkv_b_k into latent space
+        # Each Q head uses its KV group's wkv_b_k slice
+        group_idx = self._kv_group_for_q.to(device)  # (n_heads,)
+        wkv_b_k_q = wkv_b_k[group_idx]   # (n_heads, 64, kv_lora_rank)
+        wkv_b_v_q = wkv_b_v[group_idx]   # (n_heads, 64, kv_lora_rank)
 
-        if base is None:
-            return None
-        if base.dim() == 4:
-            return base.expand(bsz, self.n_local_heads, seqlen, end_pos)
-        return base
+        # Absorb: Q_nope_proj = Q_nope @ wkv_b_k  (in latent space)
+        # q_nope: (B, T, 12, 64), wkv_b_k_q: (12, 64, 96)
+        # → q_nope_proj: (B, T, 12, 96) = (B, T, n_heads, kv_lora_rank)
+        q_nope_proj = torch.einsum("bthd,hdc->bthc", q_nope, wkv_b_k_q)
+
+        # V from latent: kv_normed (B,T,96) @ wkv_b_v_q (n_heads,96,64)^T
+        # → (B, T, n_heads, v_head_dim)
+        v = torch.einsum("btc,hdc->bthd", kv_normed, wkv_b_v_q)
+
+        # ── 4. Prepare Q, K, V for SDPA ──────────────────────────────────
+        # Q = concat(q_nope_proj, q_pe) → (B, T, 12, 96+32=128)
+        q_concat = torch.cat([q_nope_proj, q_pe], dim=-1)
+
+        # K = concat(kv_normed, k_pe) expanded to n_heads
+        # kv_normed: (B,T,96) → (B,T,1,96) → (B,T,12,96)
+        kv_expanded = kv_normed.unsqueeze(2).expand(-1, -1, n_heads, -1)
+        # k_pe: (B,T,32) → (B,T,1,32) → (B,T,12,32)
+        k_pe_expanded = k_pe.unsqueeze(2).expand(-1, -1, n_heads, -1)
+        k_concat = torch.cat([kv_expanded, k_pe_expanded], dim=-1)  # (B,T,12,128)
+
+        # ── 5. QK-Norm ───────────────────────────────────────────────────
+        q_concat = self.q_norm_qk(q_concat)
+        k_concat = self.k_norm_qk(k_concat)
+
+        # ── 6. SDPA ──────────────────────────────────────────────────────
+        q_sdpa = q_concat.transpose(1, 2)  # (B, 12, T, 128)
+        k_sdpa = k_concat.transpose(1, 2)  # (B, 12, T, 128)
+        v_sdpa = v.transpose(1, 2)         # (B, 12, T, 64)
+
+        attn_out = F.scaled_dot_product_attention(
+            q_sdpa, k_sdpa, v_sdpa,
+            attn_mask=mask,
+            is_causal=(mask is None),
+            dropout_p=0.0,
+        )  # (B, 12, T, 64)
+
+        # ── 7. Output ────────────────────────────────────────────────────
+        attn_out = attn_out.transpose(1, 2).contiguous().view(B, T, -1)  # (B, T, 768)
+        return self.wo(attn_out)

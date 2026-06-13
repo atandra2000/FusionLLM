@@ -1,404 +1,274 @@
 <div align="center">
 
-<img src="https://img.shields.io/badge/python-3.10+-3776AB?style=flat-square&logo=python&logoColor=white" alt="Python 3.10+">
-<img src="https://img.shields.io/badge/pytorch-2.7-EE4C2C?style=flat-square&logo=pytorch&logoColor=white" alt="PyTorch 2.7">
-<img src="https://img.shields.io/badge/license-Apache%202.0-3DA639?style=flat-square" alt="Apache 2.0">
-<img src="https://img.shields.io/badge/code%20style-ruff-000000?style=flat-square" alt="ruff">
+# 🔮 FusionLLM-v1
 
-# FusionLLM
+**Hybrid MLA + GDN + MoE + MTP Pre-training Framework**
 
-### Hybrid MLA + GDN + MoE Pre-Training Framework
+[![Python](https://img.shields.io/badge/Python-3.10_–_3.12-3776AB?logo=python&logoColor=fff)](https://python.org)
+[![PyTorch](https://img.shields.io/badge/PyTorch-≥2.5-EE4C2C?logo=pytorch&logoColor=fff)](https://pytorch.org)
+[![License](https://img.shields.io/badge/License-Apache_2.0-blue.svg)](LICENSE)
+[![GitHub](https://img.shields.io/badge/GitHub-atandra2000%2FFusionLLM-181717?logo=github)](https://github.com/atandra2000/FusionLLM)
 
-**State-of-the-art architectural innovations, unified in a production-grade training loop.**
-
-[Quick Start](#quick-start) · [Architecture](#architecture) · [Configuration](#configuration) · [Docs](#documentation)
+**Single A100 80GB · Pure PyTorch · BF16 · ~415.6M Active Params · ~868.6M Stored**
 
 </div>
 
 ---
 
-## Why FusionLLM?
+## ✨ Overview
 
-Modern LLMs pick one trick. FusionLLM combines them all — and makes them work together:
+FusionLLM-v1 is a **single-GPU large language model pre-training framework** that fuses four cutting-edge architectural innovations into a unified 24-layer transformer:
 
-| Problem | Solution | Impact |
-|---------|----------|--------|
-| KV cache blows up at long contexts | **MLA** — low-rank KV compression (5-10× reduction) | Fits longer sequences in the same memory |
-| Dense attention is O(n²) | **GDN** — Gated Delta Net, constant-time SSM layers | Every 6th layer runs in linear time |
-| Dense FFN wastes compute | **DeepSeekMoE** — 64 routed experts, 6 activated (15.6% active) | 7B total params, only 2.5B active per token |
-| Next-token-only training limits reasoning | **MTP** — Multi-Token Prediction, depth=3 | Auxiliary heads predict 3 future tokens |
-| Hyperparameters don't transfer across scales | **μP** — μ-transfer re-initialization | Train small, scale up with stable LR |
-| Exploding logits destabilize training | **Logit softcap** — `cap · tanh(logits / cap)` | Fused CE+softcap kernel eliminates instability |
+| Component | Layers | Description |
+|-----------|--------|-------------|
+| **MLA** – Multi-Head Latent Attention | 16 | DeepSeek-style low-rank KV compression with QK-Norm & RoPE |
+| **GDN** – Gated Delta Net | 8 | Linear attention via chunked delta-rule recurrence (no softmax) |
+| **MoE** – DeepSeek Mixture-of-Experts | 16 (FFN) | 8 routed experts (top-2) + 1 shared expert, aux-loss-free routing |
+| **MTP** – Multi-Token Prediction | 2 heads | Auxiliary prediction heads for future-token supervision |
 
-**Bottom line**: ~7B total parameters, ~2.5B active, ~4M tokens/sec on 8×A100, 150B tokens in ~10.4 hours.
+The result: a **415.6M active parameter** model trained on **8.31B Chinchilla-optimal tokens** in ~5.2 days on a single A100, with **868.6M stored parameters** (due to MoE expert proliferation).
 
 ---
 
-## Architecture
+## 🏗️ Architecture
 
 ```
-┌─────────────────────────────────────────────────────────────────────────┐
-│                           FusionLLM Backbone                            │
-│                                                                         │
-│  ┌───────────┐ ┌───────────┐ ┌───────────┐ ┌───────────┐ ┌───────────┐│
-│  │   Block 0  │ │   Block 1  │ │   Block 2  │ │   Block 3  │ │   Block 4  ││
-│  │  MLA + MoE │ │  MLA + MoE │ │  MLA + MoE │ │  MLA + MoE │ │  MLA + MoE ││
-│  └─────┬─────┘ └─────┬─────┘ └─────┬─────┘ └─────┬─────┘ └─────┬─────┘│
-│        └───────────────┴───────────────┴───────────────┘              │
-│                                   │                                     │
-│                         ┌─────────┴─────────┐                           │
-│                         │      Block 5       │ ← Every 6th layer        │
-│                         │   GDN + Dense FFN  │                           │
-│                         └─────────┬─────────┘                           │
-│                                   │                                     │
-│                            (repeat ×5)                                  │
-│                                                                         │
-│  ┌─────────────────────────────────────────────────────────────────┐    │
-│  │  MTP Heads (depth=3) · Logit Softcap · Asymmetric Rescale      │    │
-│  └─────────────────────────────────────────────────────────────────┘    │
-│                                                                         │
-│  ┌──────────────────┐  ┌──────────────────┐  ┌───────────────────────┐ │
-│  │ ParallelEmbed    │  │ RMSNorm + Resid   │  │ Tied LM Head         │ │
-│  │ (Vocab-Sharded)  │  │ (Pre-Norm)        │  │ (Shared Weights)      │ │
-│  └──────────────────┘  └──────────────────┘  └───────────────────────┘ │
-└─────────────────────────────────────────────────────────────────────────┘
+Tokens (B, T)  ──►  Embed (64K × 768)  ──►  24× FusionLLMBlock  ──►  Norm  ──►  Head (tied)
+                                                    │
+                          ┌─────────────────────────┼─────────────────────────┐
+                          │                         │                         │
+                    16× MLA Layer             8× GDN Layer            MTP Heads
+                    (idx: 0,1,3,4,…)        (idx: 2,5,8,11,…)        (depth=2)
+                          │                         │
+                    ┌─────┴─────┐             ┌─────┴─────┐
+                    │           │             │           │
+                 MultiHead    DeepSeek     Gated      Dense
+               Latent Attn      MoE       Delta Net   SwiGLU
+               (GQA 12:8)   (8+1 experts)  (32 heads)  FFN
+                    │           │             │           │
+                    └───────────┴─────────────┴───────────┘
+                                    │
+                              logit softcap (15.0)
 ```
 
-**Schedule**: `5:1` — 5 MLA+MoE blocks, 1 GDN+dense-FFN block, repeated for 30 layers.
-
-### MLA — Multi-Head Latent Attention
-
-Low-rank KV projections compress the cache. Decoupled RoPE preserves positional signal.
-
-| Parameter | Value | Purpose |
-|-----------|-------|---------|
-| `q_lora_rank` | 512 | Query compression rank |
-| `kv_lora_rank` | 256 | KV compression rank |
-| `n_heads` | 32 | Query heads |
-| `n_kv_groups` | 8 | KV groups (4:1 GQA) |
-| `qk_nope_head_dim` | 128 | Non-positional dim |
-| `qk_rope_head_dim` | 64 | Rotary dim |
-| `sliding_window` | 2048 | Local attention window |
-
-### DeepSeekMoE — Fine-Grained Mixture of Experts
-
-Group-limited routing with bias-based load balancing — no auxiliary loss needed.
-
-| Parameter | Value | Purpose |
-|-----------|-------|---------|
-| `n_routed_experts` | 64 | Total routed experts |
-| `n_activated_experts` | 6 | Active per token |
-| `n_shared_experts` | 4 | Always-on experts |
-| `n_expert_groups` | 8 | Routing groups |
-| `n_limited_groups` | 3 | Groups selected per token |
-| `moe_inter_dim` | 1536 | Per-expert FFN width |
-| `moe_activation` | swiglu | Expert activation |
-
-### GDN — Gated Delta Net
-
-Qwen3-Next style SSM replacing attention every 6th layer. Linear-time inference, constant-time state update.
-
-| Parameter | Value | Purpose |
-|-----------|-------|---------|
-| `ssm_type` | gdn | GDN or legacy `mamba2` |
-| `gdn_d_state` | 128 | SSM state dimension |
-| `gdn_d_conv` | 4 | Temporal conv width |
-| `gdn_headdim` | 64 | Per-head dimension |
+### Layer Schedule (24 layers)
+| Type | Indices | Attention | Feed-Forward | Count |
+|------|---------|-----------|--------------|-------|
+| **MLA** | 0,1,3,4,6,7,9,10,12,13,15,16,18,19,21,22 | Multi-Head Latent Attention (GQA 12:8) | DeepSeekMoE (8 routed + 1 shared, top-2) | 16 |
+| **GDN** | 2,5,8,11,14,17,20,23 | Gated Delta Net (chunked delta-rule, 32 heads) | Dense SwiGLU FFN (768→2048→768) | 8 |
 
 ---
 
-## Quick Start
+## 📊 Training Recipe
 
-### Prerequisites
+### Hyperparameters
 
-- Python 3.10–3.12
-- NVIDIA GPU with CUDA 12.x (A100 80GB recommended)
-- PyTorch 2.7+
+| Setting | Value |
+|---------|-------|
+| **Optimizer** | NorMuon (lr=0.02, 2D mats) + CautiousAdamW (lr=3e-4) |
+| **Scheduler** | WSD (1% warmup, 84% stable, linear decay to 0.1×) |
+| **Batch Size** | micro=2, GA=16 → 32 seqs/step (131K tokens) |
+| **Precision** | BF16 autocast, SDPA only (no flash, no Triton) |
+| **Total Steps** | 63,400 steps (~8.31B tokens) |
+| **Sequence Length** | 4096 tokens |
+| **Vocabulary** | 64,000 tokens |
+| **Checkpoint** | safetensors every 2K steps, max keep 3 |
+| **Weight Decay** | 0.1 |
 
-### Install
+### Key Design Decisions
+
+- **μP Initialization** – Maximal Update Parametrisation for stable training at width
+- **Logit Softcap** (15.0) – Prevents logit explosion during early training
+- **Tied Embeddings** – Weight-tying between input embed and LM head
+- **Aux-Loss-Free Routing** – Biased sigmoid gate with dynamic bias update instead of auxiliary load-balance loss
+- **Gradient Checkpointing** – Reduces memory at the cost of ~15% throughput
+- **No Triton, No Flash Attention** – Pure PyTorch SDPA for maximum compatibility
+
+---
+
+## 🚀 Quick Start
+
+### Installation
 
 ```bash
-git clone https://github.com/atandra2000/FusionLLM.git
-cd FusionLLM
-
-# PyTorch with CUDA 12.8
-pip install torch==2.7.0 --index-url https://download.pytorch.org/whl/cu128
-
-# Core dependencies
-pip install -r requirements.txt
-
-# Or install with extras
-pip install -e ".[all]"
+pip install torch safetensors wandb pyyaml
 ```
 
-### Run
+### Build & Inspect the Model
+
+```python
+from models.fusionllm import build_fusionllm
+
+config = {
+    "vocab_size": 64000,
+    "max_seq_len": 4096,
+    "dim": 768,
+    "n_layers": 24,
+    "n_heads": 12,
+    "n_kv_groups": 8,
+    "q_lora_rank": 192,
+    "kv_lora_rank": 96,
+    "qk_nope_head_dim": 64,
+    "qk_rope_head_dim": 32,
+    "v_head_dim": 64,
+    "qk_norm": True,
+    "n_routed_experts": 8,
+    "n_shared_experts": 1,
+    "n_activated_experts": 2,
+    "moe_inter_dim": 2048,
+    "inter_dim": 2048,
+    "gdn_d_state": 32,
+    "gdn_d_conv": 4,
+    "gdn_headdim": 32,
+    "gdn_d_inner": 1024,
+    "gdn_chunk_size": 64,
+    "mtp_depth": 2,
+    "muP": True,
+    "logit_softcap": 15.0,
+    "tie_embeddings": True,
+}
+
+model = build_fusionllm(config)
+print(f"Parameters: {sum(p.numel() for p in model.parameters()):,}")
+```
+
+### Run Tests
 
 ```bash
-# Minimal smoke test (1 GPU, tiny model)
-bash scripts/run_smoke.sh
+# Install test dependencies
+pip install pytest pytest-cov
 
-# Full pre-training (8×A100 SXM 80GB)
-bash scripts/run_pretrain_runpod_8xa100.sh
+# Run all tests
+pytest tests/ -v --tb=short
 
-# Single-process with custom config
-python training/pretrain.py --config configs/pretrain.yaml
+# Run with coverage
+pytest tests/ --cov=models --cov=training -v
+```
+
+### Pre-training
+
+```python
+from training.trainer import Trainer
+
+trainer = Trainer(config)
+trainer.train_epoch(data_iter)
+# Outputs checkpoints to checkpoints/pretrain/
 ```
 
 ---
 
-## Configuration
-
-All settings live in `configs/`. Two entry points:
-
-| File | Use Case |
-|------|----------|
-| `configs/pretrain.yaml` | Full training — 8×A100, 150B tokens |
-| `configs/smoke_pretrain.yaml` | Debug — tiny model, fast iteration |
-
-### Key Parameters
-
-```yaml
-model:
-  dim: 2048                   # Hidden dimension
-  n_layers: 30                # Transformer blocks
-  layer_schedule: "5:1"       # MLA:GDN ratio
-  n_heads: 32                 # Query heads
-  n_kv_groups: 8              # KV groups (GQA)
-  vocab_size: 152064          # Qwen2.5 BPE
-  max_seq_len: 4096
-  mtp_depth: 3                # Multi-Token Prediction depth
-  logit_softcap: 15.0         # Caps extreme logits
-
-  # MoE
-  n_routed_experts: 64
-  n_activated_experts: 6
-  n_shared_experts: 4
-  moe_inter_dim: 1536
-
-  # GDN
-  ssm_type: "gdn"
-  gdn_d_state: 128
-
-training:
-  micro_batch_size: 2
-  gradient_accumulation_steps: 16
-  total_steps: 143_000         # ~150B tokens
-  lr: 3e-4                     # CautiousAdamW LR
-  muon_lr: 0.02                # NorMuon LR (matrix params)
-  dtype: bf16
-  optimizer: normuon_adamw      # NorMuon + CautiousAdamW
-  scheduler: wsd                # Warmup-Stable-Decay
-```
-
-### Ablation Shortcuts
-
-| Switch | Set to | Effect |
-|--------|-------|--------|
-| Disable MoE | `n_routed_experts: 0` | Falls back to dense FFN |
-| Pure attention | `layer_schedule: "mha"` | All MLA, no GDN |
-| Pure SSM | `layer_schedule: "ssm"` | All GDN, no attention |
-| Disable MTP | `mtp_depth: 0` | Standard next-token loss only |
-| Disable μP | `muP: false` | Standard initialization |
-| Disable softcap | `logit_softcap: 0.0` | Uncapped logits |
-
----
-
-## Training Pipeline
-
-### Optimizer Strategy
-
-FusionLLM runs **two optimizers** simultaneously:
-
-| Optimizer | Parameters | LR | Key Feature |
-|-----------|------------|----|-------------|
-| **NorMuon** | Matrix weights (ndim≥2, excl. embed/head) | 0.02 | Newton-Schulz orthogonalization + Adam moments |
-| **CautiousAdamW** | Embeddings, norms, biases, LM head | 3e-4 | Sign-masked weight decay (only when grad·param > 0) |
-
-### Learning Rate Schedule
-
-**WSD** (Warmup-Stable-Decay) is the default:
-
-```
-LR ▲
-   │    ┌────────────────────┐
-   │   /                      \
-   │  /   stable (84%)         \  decay
-   │ /                            \
-   └──────────────────────────────────► step
-   warmup    stable          decay
-   (1%)      (84%)           (15%)
-```
-
-### Data Pipeline
-
-```
-┌──────────────────────────────────────────────────────────────────┐
-│  Raw Sources                                                     │
-│  FineWeb-Edu (60%) · FineMath (15%) · Stack-Edu (15%)           │
-│  Cosmopedia (5%) · OpenR1-Math (5%)                              │
-└──────────────────────┬───────────────────────────────────────────┘
-                       │ tokenize + pack
-                       ▼
-┌──────────────────────────────────────────────────────────────────┐
-│  Shard Writer → manifest.jsonl + mmap'd .bin shards             │
-└──────────────────────┬───────────────────────────────────────────┘
-                       │ AsyncShardLoader (micro-prefetch, rank-aware)
-                       ▼
-┌──────────────────────────────────────────────────────────────────┐
-│  Training Loop                                                    │
-│  Stage 1: web-heavy (70% FineWeb)                                │
-│  Stage 2: code/math-heavy (25% Stack + 25% OpenR1)              │
-│  Curriculum switch at configurable step                           │
-└──────────────────────────────────────────────────────────────────┘
-```
-
-### Distributed Training
-
-FSDP2 `FULL_SHARD` — parameters, gradients, and optimizer states sharded across 8 GPUs:
-
-| Setting | Value | Rationale |
-|---------|-------|-----------|
-| `fsdp_param_dtype` | bf16 | Reduced memory footprint |
-| `fsdp_reduce_dtype` | fp32 | Numerically stable gradients |
-| `fsdp_backward_prefetch` | true | Overlap compute and communication |
-| `fsdp_forward_prefetch` | false | Saves H2D bandwidth |
-| `gradient_checkpointing` | true | ~30-40% activation memory reduction |
-| `async_checkpointing` | true | Overlap I/O with training |
-
-**Memory per GPU**: ~4.5 GB static state, ~7.3 GB total estimated on 8×A100 80GB.
-
----
-
-## Project Structure
+## 📁 Project Structure
 
 ```
 FusionLLM/
-├── models/                     # Neural architectures
-│   ├── transformer.py          #   Backbone + ParallelEmbed + TransformerBlock
-│   ├── mla.py                  #   Multi-Head Latent Attention
-│   ├── moe/                    #   DeepSeekMoE group-limited routing
-│   ├── gated_deltanet.py       #   GDN (Qwen3-Next SSM)
-│   ├── mamba.py                #   Mamba-2 (legacy SSM)
-│   ├── mtp.py                  #   Multi-Token Prediction heads
-│   ├── mup.py                  #   μP re-initialization
-│   └── rope.py                 #   Rotary Position Embedding
-├── training/                   # Training loop & schedulers
-│   ├── pretrain.py             #   FSDP2 entry point + ConfigBundle
-│   ├── trainer.py              #   Core Pretrainer class
-│   ├── normuon.py              #   NorMuon optimizer
-│   ├── schedules.py            #   Batch/seq-len ramping
-│   ├── wsd.py                  #   Warmup-Stable-Decay scheduler
-│   └── loss.py                 #   Loss functions (CE + softcap + MoE + MTP)
-├── kernels/                    # Custom CUDA/Triton kernels
-│   ├── ce_softcap.py           #   Fused cross-entropy + logit softcap
-│   ├── linear_relu2.py         #   Fused linear + ReLU²
-│   └── flash_attn.py           #   FlashAttention wrapper
-├── ops/                        # Triton kernels
-│   └── triton/grouped_gemm.py  #   Grouped GEMM for MoE
-├── data/                       # Data pipeline
-│   ├── async_loader.py         #   Two-stage async sharded loader
-│   ├── curriculum.py           #   Two-stage curriculum switching
-│   ├── prepare_data.py         #   Corpus collection + tokenization
-│   ├── dedup.py                #   MinHash + exact prefix dedup
-│   └── shard_writer.py         #   WebDataset-style sharding
-├── eval/                       # Evaluation
-│   ├── eval_core.py            #   Perplexity on token loader
-│   └── run_lm_eval.py          #   lm-eval-harness integration
-├── utils/                      # Utilities
-│   ├── distributed.py          #   FSDP2 setup + collectives
-│   ├── checkpoint/             #   Atomic/distributed checkpoint I/O
-│   └── logging.py              #   W&B + MLflow + CSV
-├── configs/                    # YAML configs
-├── scripts/                    # Launch scripts
-├── tests/                      # Unit + integration tests
-└── docs/                       # Full documentation
+├── FINAL_FROZEN_SPEC.md       # Frozen architecture specification (source of truth)
+├── IMPLEMENTATION_REPORT.md   # Detailed implementation notes & decisions
+├── TEST_PLAN.md               # Test coverage & strategy
+├── pyproject.toml             # Project metadata, deps, tooling config
+│
+├── models/
+│   ├── mla.py                 # Multi-Head Latent Attention (GQA + low-rank KV)
+│   ├── moe.py                 # DeepSeekMoE with aux-loss-free routing
+│   ├── gdn.py                 # Gated Delta Net (linear attention)
+│   ├── mtp.py                 # Multi-Token Prediction heads
+│   └── fusionllm.py          # Full model assembly (24 layers)
+│
+├── training/
+│   ├── optimizer.py           # NorMuon + CautiousAdamW optimizers
+│   ├── scheduler.py          # WSD learning rate schedule
+│   ├── checkpoint.py         # safetensors checkpoint save/load
+│   ├── validation.py         # Validation loss & perplexity
+│   └── trainer.py            # Training loop orchestrator
+│
+├── tests/
+│   ├── test_models.py        # 37 model unit tests
+│   └── test_training.py      # 18 training pipeline tests
+│
+└── archive/                  # Obsolete/legacy code (preserved for reference)
 ```
 
 ---
 
-## Optional Dependencies
+## 🧠 Component Deep-Dive
+
+### Multi-Head Latent Attention (MLA)
+Low-rank KV compression via latent spaces:
+- **Q projection**: `768 → 192 (LoRA) → RMSNorm → 12×96 (Q_nope) + 12×32 (Q_pe → RoPE)`
+- **KV projection**: `768 → 128 → Split [96 latent, 32 K_pe → RoPE] → RMSNorm → 8×128 (K_nope, V)`
+- **Absorption trick**: `Q_nope @ wkv_b_k` for efficient compute
+- **Per-layer params**: ~1.16M
+
+### Gated Delta Net (GDN)
+Linear attention via delta-rule state update:
+- **Input**: `768 → 6×1024 → Split [z, x, b, c, dt, g]`
+- **Conv**: Causal depthwise 1D (k=4, groups=1024)
+- **Delta rule**: `state = sigmoid(dt·A) * state + outer(k, v)`
+- **Read**: `y = C @ state` (+ per-head D skip)
+- **Chunked recurrence** (chunk=64), pure PyTorch, FP32 state
+- **Per-layer params**: ~8.69M
+
+### DeepSeek MoE
+Aux-loss-free biased sigmoid routing:
+- **Gate**: Biased sigmoid over 8 experts, top-2 selection
+- **Bias update**: Dynamic bias shift (`speed=1e-3`) every 10 steps
+- **Experts**: 8 routed (SwiGLU, 768→2048→768) + 1 shared
+- **Dispatch**: Pure PyTorch scatter-gather (no Triton)
+- **Per-layer params**: ~26.4M (routed) + ~3.15M (shared) = ~29.6M
+
+### Multi-Token Prediction (MTP)
+Future-token supervision:
+- **Depth 2 heads**: Predict tokens[t+2] (weight=0.10) and tokens[t+3] (weight=0.05)
+- **Input**: Concat(main_hidden[t], embed[t+1])
+- **Shared transformer block**: MLA + dense SwiGLU FFN
+- **Tied output head**: Reuses main embedding weight
+- **Additional params**: ~2.46M
+
+---
+
+## 📈 Parameter Breakdown
+
+| Component | Active Params | Stored Params | % of Total |
+|-----------|:------------:|:-------------:|:----------:|
+| Embedding (tied) | 49.15M | 49.15M | 5.66% |
+| MLA (×16) | 18.49M | 18.49M | 2.13% |
+| GDN (×8) | 69.51M | 69.51M | 8.00% |
+| MoE Routed (×16) | 63.36M | 422.38M | 48.62% |
+| MoE Shared (×16) | 50.33M | 50.33M | 5.79% |
+| Dense FFN (×8) | 25.17M | 25.17M | 2.90% |
+| MTP (depth=2) | 2.46M | 2.46M | 0.28% |
+| LM Head (tied) | — | — | — |
+| **Total Active** | **415.60M** | **—** | **47.86%** |
+| **Total Stored** | **—** | **868.56M** | **100%** |
+
+---
+
+## 🛠️ Tooling
+
+| Tool | Config |
+|------|--------|
+| **Linter** | Ruff (line-length=120, py310 target) |
+| **Formatter** | Ruff (double quotes, space indent) |
+| **Testing** | Pytest 8+ with strict markers `gpu` and `slow` |
+| **Build** | Hatchling |
 
 ```bash
-pip install -e ".[flash]"       # FlashAttention 3
-pip install -e ".[kernels]"      # Triton kernels (GDN, CE+softcap, Linear+ReLU²)
-pip install -e ".[eval]"         # lm-eval-harness
-pip install -e ".[inference]"    # vLLM serving
-pip install -e ".[distill]"     # Quantized teachers
-pip install -e ".[dev]"          # ruff, pytest, pre-commit
+# Lint & format
+ruff check models/ training/ tests/
+ruff format models/ training/ tests/
+
+# Run specific test categories
+pytest tests/ -m "not gpu"   # CPU-only tests
+pytest tests/ -m "gpu"       # GPU-required tests
 ```
 
 ---
 
-## Testing
+## 📄 License
 
-```bash
-pytest tests/                                          # All tests
-pytest tests/test_mla.py -v                            # Specific module
-pytest tests/ -m "not slow and not gpu"                # CPU-only
-pytest tests/ -m benchmark --benchmark-only            # Benchmarks
-```
-
----
-
-## Hardware
-
-| Configuration | GPUs | VRAM | Tokens/sec | 150B tokens |
-|---------------|------|------|-----------|-------------|
-| Smoke test | 1× A100 80GB | 80 GB | — | — |
-| Full training | 8× A100 SXM 80GB | 640 GB | ~4.0M | ~10.4 hours |
-
----
-
-## Documentation
-
-| Document | Description |
-|----------|-------------|
-| [Project Overview](docs/01_PROJECT_OVERVIEW.md) | Goals, maturity, key innovations |
-| [Architecture](docs/02_ARCHITECTURE.md) | Layer stack, MLA, MoE, GDN, MTP details |
-| [Training Pipeline](docs/03_TRAINING_PIPELINE.md) | Data, optimizers, schedules, evaluation |
-| [Distributed System](docs/04_DISTRIBUTED_SYSTEM.md) | FSDP2, sharding, communication patterns |
-| [Configuration Reference](docs/05_CONFIGURATION_REFERENCE.md) | Every config option, defaults, interactions |
-| [Memory & Performance](docs/06_MEMORY_AND_PERFORMANCE.md) | VRAM analysis, optimization strategies |
-| [Glossary](docs/11_GLOSSARY.md) | Terminology and module reference |
-
----
-
-## Research References
-
-FusionLLM combines ideas from multiple lines of research:
-
-- **DeepSeek-V2/V3** — MLA, DeepSeekMoE, auxiliary-loss-free bias routing, MTP
-- **Qwen3-Next** — Gated Delta Net (GDN) SSM layer
-- **Mamba-2** — Selective state space model (legacy option)
-- **Keller Jordan** — Muon optimizer (Newton-Schulz orthogonalization)
-- **μTransfer** — Stable hyperparameter transfer across scales
-- **Jamba / Nemotron-H** — Hybrid attention/SSM schedule patterns
-- **FlashAttention** — Fast attention kernel (optional FA3)
-
----
-
-## Citation
-
-```bibtex
-@software{fusionllm2025,
-  title   = {FusionLLM: Hybrid MLA + GDN + MoE Pre-Training Framework},
-  author  = {FusionLLM Contributors},
-  year    = {2025},
-  url     = {https://github.com/atandra2000/FusionLLM},
-  license = {Apache-2.0}
-}
-```
-
----
-
-## License
-
-Apache License 2.0 — see [LICENSE](LICENSE).
+Apache 2.0 — see [LICENSE](LICENSE) for details.
 
 ---
 
 <div align="center">
-
-**7B parameters. 2.5B active. 10 hours to 150B tokens.**
-
+  <sub>Built with ❤️ and PyTorch · Single GPU, Infinite Possibilities</sub>
 </div>

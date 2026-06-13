@@ -1,14 +1,14 @@
 # models/moe.py
-"""DeepSeekMoE: Mixture-of-Experts (Frozen v1 spec).
+"""DeepSeekMoE: Mixture-of-Experts.
 
-Architecture (per FINAL_FROZEN_SPEC.md §5.3):
+Architecture:
   Input (T, 768)
     ├─ Gate: Linear(768→8) + bias → Sigmoid + bias → Top-2
     ├─ 8 Routed experts (SwiGLU, 768→2048→768): top-2 active per token
     ├─ 1 Shared expert (SwiGLU, 768→2048→768): always active
     └─ Output = Σ(weight_i × expert_i(x)) + shared_expert(x)
 
-Pure PyTorch, no Triton, no distributed. Single file.
+Per-layer params: 29,568,768
 """
 
 from __future__ import annotations
@@ -34,20 +34,20 @@ class SwiGLUExpert(nn.Module):
 class DeepSeekMoE(nn.Module):
     """DeepSeekMoE with aux-loss-free biased sigmoid routing.
 
-    Frozen v1 spec:
+    Specs:
       - 8 routed experts (top-2), 1 shared expert
       - moe_inter_dim = 2048
       - Aux-loss-free biased sigmoid gate
-      - Pure PyTorch scatter-gather dispatch
+      - Scatter-gather dispatch
     """
 
     def __init__(self, config: dict):
         super().__init__()
-        self.dim = config["dim"]                           # 768
+        self.dim = config["dim"]                            # 768
         self.n_routed_experts = config["n_routed_experts"]  # 8
         self.n_shared_experts = config["n_shared_experts"]  # 1
         self.n_activated_experts = config["n_activated_experts"]  # 2 (top-2)
-        self.moe_inter_dim = config["moe_inter_dim"]       # 2048
+        self.moe_inter_dim = config["moe_inter_dim"]        # 2048
         self.capacity_factor = config.get("expert_capacity_factor", 1.5)
         self.route_scale = config.get("route_scale", 1.0)
 
@@ -102,8 +102,8 @@ class DeepSeekMoE(nn.Module):
     ) -> torch.Tensor:
         """Scatter-gather dispatch for routed experts.
 
-        Pure PyTorch implementation. Iterates over active experts,
-        gathers assigned tokens, computes expert forward, scatters back.
+        Iterates over active experts, gathers assigned tokens,
+        computes expert forward, scatters back in FP32 for numerical stability.
         """
         T = x.size(0)
         topk = weights.size(1)
@@ -111,7 +111,7 @@ class DeepSeekMoE(nn.Module):
         device = x.device
 
         # Build flat assignment arrays
-        flat_indices = indices.flatten()                  # (T*topk,)
+        flat_indices = indices.flatten()                   # (T*topk,)
         flat_weights = weights.flatten().unsqueeze(-1)     # (T*topk, 1)
         flat_token_ids = torch.arange(T, device=device).repeat_interleave(topk)  # (T*topk,)
 

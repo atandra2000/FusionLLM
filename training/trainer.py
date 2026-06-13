@@ -1,5 +1,5 @@
 # training/trainer.py
-"""Pre-training loop (Frozen v1 spec).
+"""Pre-training loop.
 
 Orchestrates:
   - Model forward/backward
@@ -12,7 +12,7 @@ Orchestrates:
   - Checkpoint save/load
   - Validation
 
-Frozen v1 spec per FINAL_FROZEN_SPEC.md §2:
+Specs:
   - micro_batch_size: 2
   - gradient_accumulation_steps: 16
   - total_steps: 63,400
@@ -44,9 +44,9 @@ from training.validation import compute_validation_loss
 
 
 class Trainer:
-    """Pre-training orchestrator for FusionLLM-v1.
+    """Pre-training orchestrator for FusionLLM.
 
-    Single-GPU training (A100 80GB). Pure PyTorch, BF16 autocast.
+    Single-GPU training (A100 80GB). BF16 autocast.
     """
 
     def __init__(self, config: dict):
@@ -139,9 +139,9 @@ class Trainer:
         try:
             import wandb
             self.wandb_run = wandb.init(
-                project=self.config.get("wandb_project", "fusionllm-v1"),
+                project=self.config.get("wandb_project", "fusionllm"),
                 config=self.config,
-                tags=self.config.get("wandb_tags", ["v1-frozen", "single-gpu", "pure-pytorch"]),
+                tags=self.config.get("wandb_tags", ["single-gpu"]),
                 reinit=True,
             )
         except Exception as e:

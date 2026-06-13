@@ -1,0 +1,72 @@
+# data/config/mixture.yaml
+# Frozen dataset mixture for FusionLLM-v1 pretraining.
+# Weights are shares of the 8.31B training tokens.
+# Run `python -m data.scripts.download_raw --config data/config/mixture.yaml`
+# to start the pipeline.
+
+# Each source has a HuggingFace id, config, a text field, and a streaming mode.
+# `weight` is the share of the 8.31B training tokens.
+# `max_tokens` is the cap (computed = round(8.31B * weight)); both fields are
+# present so the operator can sanity-check the mix without re-deriving math.
+#
+# Total target tokens (frozen): 8310000000
+# Total train tokens (97% of target): 8056000000
+# Total val tokens (1.5%):           124650000
+# Total test tokens (1.5%):          124650000
+
+total_tokens: 8310000000
+train_fraction: 0.97
+val_fraction: 0.015
+test_fraction: 0.015
+
+sources:
+  - id: fineweb_edu
+    weight: 0.55
+    hf_id: HuggingFaceFW/fineweb-edu
+    hf_config: sample-10BT
+    hf_split: train
+    hf_revision: main
+    text_field: text
+
+  - id: fineweb
+    weight: 0.20
+    hf_id: HuggingFaceFW/fineweb
+    hf_config: sample-10BT
+    hf_split: train
+    hf_revision: main
+    text_field: text
+
+  - id: stack_python
+    weight: 0.10
+    hf_id: bigcode/the-stack-v2-train-full-ids
+    hf_config: Python
+    hf_split: train
+    hf_revision: main
+    text_field: content
+
+  - id: slimpajama
+    weight: 0.08
+    hf_id: cerebras/SlimPajama-627B
+    hf_config: dedup
+    hf_split: train
+    hf_revision: main
+    text_field: text
+
+  - id: wikipedia
+    weight: 0.04
+    hf_id: allenai/dolma
+    hf_config: v1_6-sample
+    hf_split: train
+    hf_revision: main
+    text_field: text
+    # Subset to the wikipedia source within dolma. We use streaming and
+    # filter rows whose `source` field is "wikipedia" when present.
+
+  - id: books
+    weight: 0.03
+    hf_id: allenai/dolma
+    hf_config: v1_6-sample
+    hf_split: train
+    hf_revision: main
+    text_field: text
+    # Subset to source == "books" within dolma.

@@ -16,6 +16,10 @@ dependencies = [
     "numpy>=1.24.0",
     # Logging
     "wandb>=0.17.0",
+    # Data pipeline
+    "datasets>=2.14.0",
+    "sentencepiece>=0.2.0",
+    "zstandard>=0.21.0",
 ]
 
 [project.optional-dependencies]
@@ -27,6 +31,12 @@ dev = [
     "ruff>=0.4.0",
     "pre-commit>=3.7.0",
 ]
+data = [
+    # Convenience extra: full set needed to run the data pipeline.
+    "datasets>=2.14.0",
+    "sentencepiece>=0.2.0",
+    "zstandard>=0.21.0",
+]
 
 [project.urls]
 Repository = "https://github.com/atandra2000/FusionLLM"
@@ -37,7 +47,7 @@ requires = ["hatchling"]
 build-backend = "hatchling.build"
 
 [tool.hatch.build.targets.wheel]
-packages = ["models", "training", "utils"]
+packages = ["models", "training", "utils", "data"]
 
 # ── Tooling: ruff ──────────────────────────────────────────────────────────
 [tool.ruff]

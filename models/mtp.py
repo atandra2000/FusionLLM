@@ -1,7 +1,7 @@
 # models/mtp.py
-"""Multi-Token Prediction (Frozen v1 spec).
+"""Multi-Token Prediction.
 
-Architecture (per FINAL_FROZEN_SPEC.md §5.6):
+Architecture:
   MTP Module 1:
     ├─ proj: Linear(2×768→768)
     │     input = concat(main_hidden[t], embed[t+1])
@@ -17,7 +17,7 @@ Architecture (per FINAL_FROZEN_SPEC.md §5.6):
     └─ Target: tokens[t+3]
     Weight = 0.05
 
-Pure PyTorch, BF16 compatible. Tied head to main embedding.
+Per-layer params: 2.46M
 """
 
 from __future__ import annotations
@@ -92,7 +92,7 @@ class MTPModule(nn.Module):
 
     def forward(
         self,
-        hidden: torch.Tensor,  # (B, T, dim)
+        hidden: torch.Tensor,      # (B, T, dim)
         target_emb: torch.Tensor,  # (B, T, dim)
     ) -> tuple[torch.Tensor, torch.Tensor]:
         """Forward pass.
@@ -118,7 +118,7 @@ class MultiTokenPrediction(nn.Module):
     Each head predicts t[d+1] steps ahead using the previous head's hidden
     state and the target token's embedding.
 
-    Frozen v1 spec:
+    Specs:
       - mtp_depth = 2
       - mtp_loss_weight_1 = 0.10, mtp_loss_weight_2 = 0.05
       - mtp_inter_dim = 2048
@@ -193,12 +193,12 @@ class MultiTokenPrediction(nn.Module):
                 break
 
             # Inputs
-            h_in = prev_hidden[:, :usable]                     # (B, usable, dim)
+            h_in = prev_hidden[:, :usable]                              # (B, usable, dim)
             target_emb = self.embed(tokens[:, depth : depth + usable])  # (B, usable, dim)
-            targets = tokens[:, depth + 1 : depth + 1 + usable]  # (B, usable)
+            targets = tokens[:, depth + 1 : depth + 1 + usable]         # (B, usable)
 
             # Forward through MTP module
-            logits, new_hidden = mtp(h_in, target_emb)  # (B, usable, vocab), (B, usable, dim)
+            logits, new_hidden = mtp(h_in, target_emb)                  # (B, usable, vocab), (B, usable, dim)
 
             mtp_outputs.append((logits, targets, torch.tensor(self.mtp_loss_weights[d], device=logits.device)))
             prev_hidden = new_hidden

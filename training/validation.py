@@ -1,11 +1,11 @@
 # training/validation.py
-"""Validation and evaluation (Frozen v1 spec).
+"""Validation and evaluation.
 
-Per FINAL_FROZEN_SPEC.md §2:
+Specs:
   - eval_enabled: true
   - eval_interval_steps: 5000
   - eval_max_batches: 8
-  - eval_synthetic: true (uses synthetic data for validation perplexity)
+  - eval_synthetic: true
 """
 
 from __future__ import annotations

@@ -1,0 +1,64 @@
+# data/config/tokenizer.yaml
+# Frozen tokenizer recipe for FusionLLM-v1.
+
+vocab_size: 64000
+num_special_tokens: 32       # 4 active + 28 reserved
+byte_fallback: true
+normalization_rule_name: nfkc
+split_digits: false
+character_coverage: 1.0
+max_sentence_length: 10000
+
+# Active special tokens (must appear in this order, ids 0..3)
+active_special_tokens:
+  - "<|endoftext|>"   # id 0 — EOS / doc separator
+  - "<|bos|>"         # id 1
+  - "<|pad|>"         # id 2
+  - "<|unk|>"         # id 3
+
+# Reserved special tokens (ids 4..31)
+reserved_special_tokens:
+  - "<|reserved_00|>"
+  - "<|reserved_01|>"
+  - "<|reserved_02|>"
+  - "<|reserved_03|>"
+  - "<|reserved_04|>"
+  - "<|reserved_05|>"
+  - "<|reserved_06|>"
+  - "<|reserved_07|>"
+  - "<|reserved_08|>"
+  - "<|reserved_09|>"
+  - "<|reserved_10|>"
+  - "<|reserved_11|>"
+  - "<|reserved_12|>"
+  - "<|reserved_13|>"
+  - "<|reserved_14|>"
+  - "<|reserved_15|>"
+  - "<|reserved_16|>"
+  - "<|reserved_17|>"
+  - "<|reserved_18|>"
+  - "<|reserved_19|>"
+  - "<|reserved_20|>"
+  - "<|reserved_21|>"
+  - "<|reserved_22|>"
+  - "<|reserved_23|>"
+  - "<|reserved_24|>"
+  - "<|reserved_25|>"
+  - "<|reserved_26|>"
+  - "<|reserved_27|>"
+
+# Training-corpus recipe (for tokenizer training only — separate from
+# the pretraining mixture). The training corpus draws from the cleaned
+# data/clean/<source>/*.jsonl.zst files and rebalances the code slice
+# upward so the BPE gets good Python coverage.
+tokenizer_train_size_gb: 25
+tokenizer_train_mix:
+  fineweb_edu: 0.50
+  fineweb: 0.20
+  stack_python: 0.20
+  slimpajama: 0.05
+  wikipedia: 0.02
+  books: 0.03
+
+# Output directory (relative to repo root).
+output_dir: data/tokenizer

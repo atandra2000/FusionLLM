@@ -161,9 +161,7 @@ trainer.train_epoch(data_iter)
 
 ```
 FusionLLM/
-├── FINAL_FROZEN_SPEC.md       # Frozen architecture specification (source of truth)
 ├── IMPLEMENTATION_REPORT.md   # Detailed implementation notes & decisions
-├── TEST_PLAN.md               # Test coverage & strategy
 ├── pyproject.toml             # Project metadata, deps, tooling config
 │
 ├── models/
@@ -184,7 +182,39 @@ FusionLLM/
 │   ├── test_models.py        # 37 model unit tests
 │   └── test_training.py      # 18 training pipeline tests
 │
-└── archive/                  # Obsolete/legacy code (preserved for reference)
+├── data/
+│   ├── common.py             # Shared utilities: I/O, hashing, logging, config
+│   ├── config/               # Mixture weights & tokenizer hyperparameters
+│   └── scripts/
+│       ├── download_raw.py         # Stage 1: stream HF datasets → zstd JSONL
+│       ├── preprocess.py           # Stage 2: clean & filter raw documents
+│       ├── train_tokenizer.py      # Stage 3: train 64K BPE SentencePiece model
+│       ├── tokenize.py             # Stage 4: tokenize clean text → uint16 tokens
+│       ├── shard_writer.py         # Stage 5: pack tokens into .npy shards
+│       └── streaming_dataloader.py # Stage 6: mmap shards → (B,T) torch tensors
+```
+
+### Data Pipeline
+
+A 6-stage pipeline builds the 8.31B token training corpus from HuggingFace sources (FineWeb-Edu, FineWeb, The Stack v2, SlimPajama, Dolma). Each stage is resumable via JSON state files in `data/state/`:
+
+| Stage | Script | Input → Output |
+|-------|--------|----------------|
+| 1. Download | `download_raw.py` | HF streaming datasets → `data/raw/*/shard_*.jsonl.zst` |
+| 2. Clean | `preprocess.py` | Raw → `data/clean/*/shard_*.jsonl.zst` (NFKC, PII strip, length/symbol/URL filters) |
+| 3. Tokenizer | `train_tokenizer.py` | Clean sample → `data/tokenizer/tokenizer.model` (64K byte-level BPE) |
+| 4. Tokenize | `tokenize.py` | Clean → `data/tokens/*/tokens_*.bin` (uint16, EOS-terminated) |
+| 5. Pack | `shard_writer.py` | Tokens → `data/shards/{train,val,test}/shard_*.npy` (int32, 4096×4096) |
+| 6. Stream | `streaming_dataloader.py` | Shards → `(tokens, targets)` batches consumed by the trainer |
+
+```bash
+# Run the full pipeline (after installing data extras)
+pip install ".[data]"
+python -m data.scripts.download_raw
+python -m data.scripts.preprocess
+python -m data.scripts.train_tokenizer
+python -m data.scripts.tokenize
+python -m data.scripts.shard_writer
 ```
 
 ---

@@ -1,7 +1,7 @@
 # training/checkpoint.py
-"""Checkpoint save/load (Frozen v1 spec).
+"""Checkpoint save/load.
 
-Checkpoint format (per FINAL_FROZEN_SPEC.md §8):
+Checkpoint format:
   - format: "safetensors"
   - precision: bf16 weights, fp32 optim
   - Contents:
@@ -46,7 +46,7 @@ def save_checkpoint(
     """Save a training checkpoint.
 
     Args:
-        model: The model (FusionLLM or MTP-wrapped).
+        model: The model (FusionLLM).
         muon_opt: NorMuon optimizer.
         adamw_opt: CautiousAdamW optimizer.
         scheduler: WSD scheduler.

@@ -1,17 +1,17 @@
 # models/fusionllm.py
-"""FusionLLM-v1: Hybrid MLA + GDN + MoE + MTP (Frozen v1 spec).
+"""FusionLLM-v1: Hybrid MLA + GDN + MoE + MTP.
 
 Layer schedule (24 layers):
   - 16 MLA layers (indices 0,1,3,4,6,7,9,10,12,13,15,16,18,19,21,22) → MoE FFN
   -  8 GDN layers (indices 2,5,8,11,14,17,20,23) → Dense FFN
 
-Architecture (per FINAL_FROZEN_SPEC.md):
+Architecture:
   - Tied embeddings (vocab=64000, dim=768)
   - 24 layers with alternating MLA/MoE and GDN/DenseFFN
   - MTP (depth=2) auxiliary prediction heads
   - μP initialization
   - Logit softcap (15.0)
-  - Pure PyTorch, BF16 compatible, no Triton, no flash attention
+  - BF16 compatible
 """
 
 from __future__ import annotations
@@ -44,7 +44,7 @@ class DenseFFN(nn.Module):
 class FusionLLMBlock(nn.Module):
     """One block: either (MLA + MoE) or (GDN + Dense FFN).
 
-    Frozen v1 spec: no gradient checkpointing config toggle at block level;
+    Specs: no gradient checkpointing config toggle at block level;
     uses torch.utils.checkpoint at the module level.
     """
 
@@ -80,7 +80,7 @@ def softcap(logits: torch.Tensor, cap: float = 15.0) -> torch.Tensor:
 def muP_init(model: nn.Module, config: dict) -> None:
     """Apply μP (Maximal Update Parametrisation) initialisation.
 
-    Per FINAL_FROZEN_SPEC.md §6:
+    Specs:
       - Residual stream: std = 1 / sqrt(n_layers)
       - Attention / FFN matrices: std = 1 / dim
       - Embeddings: std = 1 / sqrt(dim)
@@ -116,13 +116,12 @@ class FusionLLM(nn.Module):
       - Tied embeddings (64000 × 768)
       - μP init
       - Logit softcap (15.0)
-      - Pure PyTorch, BF16 compatible
     """
 
     def __init__(self, config: dict):
         super().__init__()
         self.config = config
-        self.dim = config["dim"]                         # 768
+        self.dim = config["dim"]                          # 768
         self.vocab_size = config["vocab_size"]            # 64000
         self.n_layers = config["n_layers"]                # 24
         self.max_seq_len = config["max_seq_len"]          # 4096
@@ -197,7 +196,7 @@ class FusionLLM(nn.Module):
 
         Args:
             tokens: (B, T) token IDs.
-            start_pos: position offset (unused in v1; kept for MTP API compat).
+            start_pos: position offset.
 
         Returns:
             logits: (B, T, vocab_size)
@@ -225,10 +224,10 @@ class FusionLLM(nn.Module):
 
 
 def build_fusionllm(config: dict) -> FusionLLM:
-    """Build a FusionLLM-v1 model from a frozen config dict.
+    """Build a FusionLLM model.
 
     Args:
-        config: dict matching FINAL_FROZEN_SPEC.md §1 fields.
+        config: dict matching specs.
 
     Returns:
         FusionLLM model (not wrapped by MTP).

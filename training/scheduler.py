@@ -1,7 +1,7 @@
 # training/scheduler.py
-"""WSD (Warmup-Stable-Decay) Learning Rate Scheduler (Frozen v1 spec).
+"""WSD (Warmup-Stable-Decay) Learning Rate Scheduler.
 
-Schedule (per FINAL_FROZEN_SPEC.md §2):
+Schedule:
   - warmup_frac = 0.01 (634 steps)
   - stable_frac = 0.84 (53,256 steps)
   - decay: linear from peak to min_lr_ratio × peak

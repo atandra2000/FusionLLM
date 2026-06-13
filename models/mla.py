@@ -1,7 +1,7 @@
 # models/mla.py
-"""Multi-Head Latent Attention (Frozen v1 spec).
+"""Multi-Head Latent Attention.
 
-Architecture (per FINAL_FROZEN_SPEC.md §5.2):
+Architecture:
   Input (B, T, 768)
     ├─ wq_a: Linear(768→192) + RMSNorm(192) + wq_b: Linear(192→12×96=1152)
     │         └─ Split: Q_nope (12, 64), Q_pe (12, 32) → RoPE(Q_pe)
@@ -12,7 +12,7 @@ Architecture (per FINAL_FROZEN_SPEC.md §5.2):
     ├─ GQA expand K/V: 8 → 12 groups
     ├─ Concat: Q = [Q_nope_proj, Q_pe], K = [KV_normed, K_pe]
     ├─ QK-Norm: RMSNorm on Q and K (dim = kv_lora_rank + qk_rope_head_dim = 128)
-    ├─ SDPA (causal, no FA, no Triton)
+    ├─ SDPA
     └─ wo: Linear(768→768)
 
 Per-layer params: 1,155,616
@@ -26,7 +26,7 @@ import torch.nn.functional as F
 
 
 class RotaryEmbedding(nn.Module):
-    """Minimal RoPE module — no YaRN, no dynamic extend beyond max_seq_len."""
+    """Rotary Positional Embedding."""
 
     def __init__(self, head_dim: int, max_seq_len: int, theta: float = 10000.0):
         super().__init__()
@@ -67,28 +67,25 @@ class RotaryEmbedding(nn.Module):
 
 
 class MultiHeadLatentAttention(nn.Module):
-    """Multi-Head Latent Attention with GQA-on-top-of-MLA.
-
-    Frozen v1 spec — no sliding window, no flash attention, no Triton.
-    """
+    """Multi-Head Latent Attention with GQA-on-top-of-MLA."""
 
     def __init__(self, config: dict, layer_idx: int = 0):
         super().__init__()
         self.layer_idx = layer_idx
 
-        d = config["dim"]                          # 768
+        d = config["dim"]                           # 768
         n_heads = config["n_heads"]                 # 12
         n_kv_groups = config["n_kv_groups"]         # 8
         self.n_heads = n_heads
         self.n_kv_groups = n_kv_groups
 
-        self.q_lora_rank = config["q_lora_rank"]          # 192
-        self.kv_lora_rank = config["kv_lora_rank"]        # 96
+        self.q_lora_rank = config["q_lora_rank"]            # 192
+        self.kv_lora_rank = config["kv_lora_rank"]          # 96
         self.qk_nope_head_dim = config["qk_nope_head_dim"]  # 64
         self.qk_rope_head_dim = config["qk_rope_head_dim"]  # 32
-        self.v_head_dim = config["v_head_dim"]            # 64
+        self.v_head_dim = config["v_head_dim"]              # 64
         self.qk_head_dim = self.qk_nope_head_dim + self.qk_rope_head_dim  # 96
-        self.max_seq_len = config["max_seq_len"]          # 4096
+        self.max_seq_len = config["max_seq_len"]            # 4096
 
         # ── Query low-rank projection ────────────────────────────────────
         self.wq_a = nn.Linear(d, self.q_lora_rank, bias=False)       # 768→192
@@ -109,7 +106,7 @@ class MultiHeadLatentAttention(nn.Module):
         self.wo = nn.Linear(n_heads * self.v_head_dim, d, bias=False)  # 768→768
 
         # ── QK-Norm (applied to Q/K concat: dim = kv_lora_rank + qk_rope_head_dim) ──
-        self.qk_norm_dim = self.kv_lora_rank + self.qk_rope_head_dim  # 96+32=128
+        self.qk_norm_dim = self.kv_lora_rank + self.qk_rope_head_dim                     # 96+32=128
         self.q_norm_qk = nn.RMSNorm(self.qk_norm_dim, eps=1e-6)
         self.k_norm_qk = nn.RMSNorm(self.qk_norm_dim, eps=1e-6)
 
@@ -145,15 +142,15 @@ class MultiHeadLatentAttention(nn.Module):
         kv_lora_rank = self.kv_lora_rank
 
         # ── 1. Query ─────────────────────────────────────────────────────
-        q = self.wq_b(self.q_norm(self.wq_a(x)))  # (B, T, n_heads * qk_head_dim)
+        q = self.wq_b(self.q_norm(self.wq_a(x)))           # (B, T, n_heads * qk_head_dim)
         q = q.view(B, T, n_heads, self.qk_head_dim)
         q_nope, q_pe = q.split([self.qk_nope_head_dim, self.qk_rope_head_dim], dim=-1)
-        q_pe = self.rope(q_pe, start_pos)  # (B, T, n_heads, qk_rope_head_dim)
+        q_pe = self.rope(q_pe, start_pos)                 # (B, T, n_heads, qk_rope_head_dim)
 
         # ── 2. KV latent compression ─────────────────────────────────────
-        kv_a = self.wkv_a(x)  # (B, T, kv_lora_rank + qk_rope_head_dim)
+        kv_a = self.wkv_a(x)                             # (B, T, kv_lora_rank + qk_rope_head_dim)
         kv_latent, k_pe_raw = kv_a.split([kv_lora_rank, self.qk_rope_head_dim], dim=-1)
-        kv_normed = self.kv_norm(kv_latent)  # (B, T, kv_lora_rank=96)
+        kv_normed = self.kv_norm(kv_latent)             # (B, T, kv_lora_rank=96)
         k_pe = self.rope(k_pe_raw.unsqueeze(-2), start_pos).squeeze(-2)  # (B, T, qk_rope_head_dim)
 
         # ── 3. Absorption trick ──────────────────────────────────────────
@@ -165,7 +162,7 @@ class MultiHeadLatentAttention(nn.Module):
             kv_lora_rank,
         )
         # Split into K and V parts
-        wkv_b_k = wkv_b_w[:, :self.qk_nope_head_dim, :]  # (8, 64, 96)  — produces K_nope
+        wkv_b_k = wkv_b_w[:, :self.qk_nope_head_dim, :]   # (8, 64, 96)  — produces K_nope
         wkv_b_v = wkv_b_w[:, self.qk_nope_head_dim:, :]   # (8, 64, 96)  — produces V
 
         # For absorption: project Q_nope through wkv_b_k into latent space

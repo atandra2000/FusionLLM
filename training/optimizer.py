@@ -1,7 +1,7 @@
 # training/optimizer.py
-"""Optimizer: CautiousAdamW + NorMuon (Frozen v1 spec).
+"""Optimizer: CautiousAdamW + NorMuon.
 
-Optimizer strategy (per FINAL_FROZEN_SPEC.md §2):
+Optimizer strategy:
   - NorMuon for 2D weight matrices in MLP/GDN (moe_inter_dim, gdn_d_inner, etc.)
   - CautiousAdamW for embeddings, LM head, MTP projections, norms, biases
   - muon_lr = 0.02, muon_momentum = 0.95
@@ -32,8 +32,6 @@ class NorMuon(Optimizer):
       4. Apply weight decay (decoupled, with cautious masking).
 
     For non-matrix params: falls back to standard AdamW.
-
-    Reference: Keller Jordan, modded-nanogpt speedrun #41-42.
     """
 
     def __init__(
@@ -131,7 +129,7 @@ class CautiousAdamW(Optimizer):
     Standard AdamW for all params. Cautious weight decay only applies
     where gradient and parameter directions agree.
 
-    Frozen v1 spec: betas=(0.9, 0.95), lr=3e-4, weight_decay=0.1.
+    Spec: betas=(0.9, 0.95), lr=3e-4, weight_decay=0.1.
     """
 
     def __init__(
@@ -227,7 +225,7 @@ def build_optimizers(
     gate biases, and all 1D params.
 
     Args:
-        model: The model (FusionLLM or MTP-wrapped).
+        model: The model (FusionLLM).
         adamw_lr: Learning rate for AdamW params.
         muon_lr: Learning rate for NorMuon params.
         muon_momentum: Momentum for NorMuon (uses beta1).

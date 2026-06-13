@@ -1,5 +1,5 @@
 # models/gdn.py
-"""Gated Delta Net (GDN) — Linear Attention via Delta Rule (Frozen v1 spec).
+"""Gated Delta Net (GDN) — Linear Attention via Delta Rule.
 
 Architecture (per FINAL_FROZEN_SPEC.md §5.4):
   Input (B, T, 768)
@@ -11,7 +11,7 @@ Architecture (per FINAL_FROZEN_SPEC.md §5.4):
     ├─ g_proj: Linear(1024→1024) → Sigmoid → g
     ├─ v = x_conv.view(B, T, 32, 32)     # headdim = 32
     ├─ A = -exp(A_log)   # (32, 32) fixed decay
-    ├─ Delta-rule recurrence (chunked, pure PyTorch, chunk_size=64)
+    ├─ Delta-rule recurrence (chunked, chunk_size=64, FP32 state)
     ├─ y = y * g * SiLU(z)
     └─ out_proj: Linear(1024→768)
 
@@ -31,8 +31,8 @@ class GatedDeltaNet(nn.Module):
     Frozen v1 spec:
       - d_inner = 1024, d_state = 32, headdim = 32, n_heads = 32
       - d_conv = 4, chunk_size = 64
-      - Pure PyTorch chunked delta-rule recurrence
-      - No Triton
+      - FP32 state
+      - No flash attention
     """
 
     def __init__(self, config: dict, layer_idx: int = 0):
@@ -77,8 +77,8 @@ class GatedDeltaNet(nn.Module):
         self.dt_bias._no_weight_decay = True
 
         # ── B, C, dt, g projections ───────────────────────────────────────
-        self.b_proj = nn.Linear(self.d_inner, self.n_heads * self.d_state, bias=False)   # 1024→1024
-        self.c_proj = nn.Linear(self.d_inner, self.n_heads * self.d_state, bias=False)   # 1024→1024
+        self.b_proj = nn.Linear(self.d_inner, self.n_heads * self.d_state, bias=False)     # 1024→1024
+        self.c_proj = nn.Linear(self.d_inner, self.n_heads * self.d_state, bias=False)     # 1024→1024
         self.dt_proj = nn.Linear(self.d_inner, self.n_heads, bias=False)                   # 1024→32 (dt_bias is separate)
         self.g_proj = nn.Linear(self.d_inner, self.d_inner, bias=False)                    # 1024→1024
 
@@ -94,8 +94,8 @@ class GatedDeltaNet(nn.Module):
         d_state = self.d_state
 
         # ── 1. Input projection → 6 streams ────────────────────────────────
-        zxbcdtg = self.in_proj(x)  # (B, T, 6*d_inner)
-        z = zxbcdtg[..., 0*d_inner : 1*d_inner]   # (B, T, d_inner)
+        zxbcdtg = self.in_proj(x)                   # (B, T, 6*d_inner)
+        z = zxbcdtg[..., 0*d_inner : 1*d_inner]     # (B, T, d_inner)
         x_in = zxbcdtg[..., 1*d_inner : 2*d_inner]  # (B, T, d_inner)
 
         # ── 2. Causal conv1d on x stream ───────────────────────────────────
@@ -116,7 +116,7 @@ class GatedDeltaNet(nn.Module):
         # ── 5. Decay matrix A ──────────────────────────────────────────────
         A = -torch.exp(self.A_log)  # (n_heads, d_state), ≤ -1
 
-        # ── 6. Chunked delta-rule recurrence (pure PyTorch) ────────────────
+        # ── 6. Chunked delta-rule recurrence (FP32 state) ────────────────
         y = self._chunked_delta_rule(v, dt, A, B_proj, C_proj)
 
         # ── 7. Per-head D skip connection ──────────────────────────────────
@@ -139,7 +139,7 @@ class GatedDeltaNet(nn.Module):
         B: torch.Tensor,    # (B, T, n_heads, d_state)
         C: torch.Tensor,    # (B, T, n_heads, d_state)
     ) -> torch.Tensor:
-        """Chunked delta-rule recurrence in pure PyTorch.
+        """Chunked delta-rule recurrence.
 
         The delta rule state update at step t:
             decay_t = sigmoid(dt_t * A)     # (B, n_heads, d_state)
@@ -177,20 +177,20 @@ class GatedDeltaNet(nn.Module):
             chunk_len = chunk_end - chunk_start
 
             # Get chunk slices
-            v_chunk = v[:, chunk_start:chunk_end].float()        # (B, chunk, n_heads, headdim)
-            k_chunk = k[:, chunk_start:chunk_end].float()         # (B, chunk, n_heads, d_state)
+            v_chunk = v[:, chunk_start:chunk_end].float()          # (B, chunk, n_heads, headdim)
+            k_chunk = k[:, chunk_start:chunk_end].float()          # (B, chunk, n_heads, d_state)
             decay_chunk = decay[:, chunk_start:chunk_end].float()  # (B, chunk, n_heads, d_state)
 
             for t in range(chunk_len):
-                k_t = k_chunk[:, t]      # (B, n_heads, d_state)
-                v_t = v_chunk[:, t]      # (B, n_heads, headdim)
+                k_t = k_chunk[:, t]        # (B, n_heads, d_state)
+                v_t = v_chunk[:, t]        # (B, n_heads, headdim)
                 dec_t = decay_chunk[:, t]  # (B, n_heads, d_state)
 
                 # Write: state = decay * state + outer(k, v)
                 # outer(k, v): (B, n_heads, d_state, 1) * (B, n_heads, 1, headdim)
                 # → (B, n_heads, d_state, headdim) then transpose to (B, n_heads, headdim, d_state)
-                k_unsq = k_t.unsqueeze(-2)    # (B, n_heads, 1, d_state)
-                v_unsq = v_t.unsqueeze(-1)    # (B, n_heads, headdim, 1)
+                k_unsq = k_t.unsqueeze(-2)     # (B, n_heads, 1, d_state)
+                v_unsq = v_t.unsqueeze(-1)     # (B, n_heads, headdim, 1)
                 write = v_unsq @ k_unsq        # (B, n_heads, headdim, d_state)
 
                 # Apply decay and add outer product

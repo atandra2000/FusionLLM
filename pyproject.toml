@@ -37,6 +37,10 @@ data = [
     "sentencepiece>=0.2.0",
     "zstandard>=0.21.0",
 ]
+optim = [
+    # Flash Attention 2 for 40-50% faster attention (requires CUDA 12.x, A100 GPU)
+    "flash-attn>=2.5.0",
+]
 
 [project.urls]
 Repository = "https://github.com/atandra2000/FusionLLM"

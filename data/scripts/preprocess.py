@@ -1,14 +1,4 @@
 # data/scripts/preprocess.py
-# Stage 2: read data/raw/<source>/shard_*.jsonl.zst, apply basic cleaning
-# filters, write data/clean/<source>/shard_*.jsonl.zst.
-#
-# Simplification vs the original plan:
-#   * No fasttext language ID (all sources are already English-curated).
-#   * No toxicity / Jigsaw filter.
-#   * No per-document dedup (dedup is too expensive at this scale; we
-#     accept a small duplication rate).
-#   * Only: NFKC, control-char strip, PII strip, length filter,
-#     symbol/URL density filter.
 
 from __future__ import annotations
 
@@ -32,13 +22,11 @@ from data.common import (
     seed_everything,
 )
 
-# Cleaning thresholds (all conservative)
 MIN_CHARS = 200
 MAX_CHARS = 200_000
-MAX_SYMBOL_RATIO = 0.20   # non-alphanumeric / total
-MAX_URL_DENSITY = 0.30    # urls / word count
+MAX_SYMBOL_RATIO = 0.20
+MAX_URL_DENSITY = 0.30
 
-# Cached regexes
 _URL_RE = re.compile(r"https?://[^\s]+|www\.[^\s]+")
 _WORD_RE = re.compile(r"\b[\w']+\b")
 _NONALNUM_RE = re.compile(r"[^A-Za-z0-9\s]")
@@ -50,11 +38,9 @@ def _passes_filters(text: str) -> bool:
     n = len(text)
     if n < MIN_CHARS or n > MAX_CHARS:
         return False
-    # Symbol density
     nonalnum = len(_NONALNUM_RE.findall(text))
     if nonalnum / max(n, 1) > MAX_SYMBOL_RATIO:
         return False
-    # URL density
     words = _WORD_RE.findall(text)
     if not words:
         return False
@@ -64,16 +50,7 @@ def _passes_filters(text: str) -> bool:
     return True
 
 
-def preprocess_source(
-    source_id: str,
-    state: dict,
-    *,
-    in_start: int | None = None,
-) -> int:
-    """Clean one source. Returns rows written.
-
-    in_start: skip the first N rows of the very first input file (resume).
-    """
+def preprocess_source(source_id: str, state: dict, *, in_start: int | None = None) -> int:
     in_dir = RAW_ROOT / source_id
     out_dir = CLEAN_ROOT / source_id
     out_dir.mkdir(parents=True, exist_ok=True)
@@ -87,7 +64,7 @@ def preprocess_source(
 
     raw_files = list(iter_source_shards(RAW_ROOT, source_id))
     if not raw_files:
-        log(f"[{source_id}] no raw files found in {in_dir}")
+        log(f"[{source_id}] no raw files found")
         return 0
 
     out_path = out_dir / f"shard_{out_file_idx:05d}.jsonl.zst"
@@ -140,12 +117,10 @@ def preprocess_source(
                 )
                 save_state("preprocess", state)
 
-        # Done with this input file
         cur_in_idx = fi + 1
         cur_in_row = 0
 
     writer.close()
-    # Clean up empty trailing file
     if bytes_in_file == 0 and out_path.exists():
         out_path.unlink()
         out_file_idx = max(0, out_file_idx - 1)
@@ -158,12 +133,12 @@ def preprocess_source(
         rows_out=rows_out,
     )
     save_state("preprocess", state)
-    log(f"[{source_id}] kept {new_out} / {new_in} rows ({100*new_out/max(new_in,1):.1f}%) in {out_dir}")
+    log(f"[{source_id}] kept {new_out} / {new_in} rows")
     return new_out
 
 
 def main(argv: list[str] | None = None) -> int:
-    parser = argparse.ArgumentParser(description="Stage 2: clean raw jsonl.zst -> clean jsonl.zst")
+    parser = argparse.ArgumentParser(description="Stage 2: clean raw jsonl.zst")
     parser.add_argument("--config", default="data/config/mixture.yaml")
     parser.add_argument("--source", default=None, help="If set, only process this source id")
     args = parser.parse_args(argv)
@@ -178,7 +153,7 @@ def main(argv: list[str] | None = None) -> int:
         try:
             preprocess_source(spec["id"], state)
         except KeyboardInterrupt:
-            log("Interrupted. State saved; rerun to resume.")
+            log("Interrupted. State saved.")
             return 130
         except Exception as e:
             log(f"[{spec['id']}] ERROR: {type(e).__name__}: {e}")

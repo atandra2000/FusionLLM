@@ -9,7 +9,7 @@
 [![License](https://img.shields.io/badge/License-Apache_2.0-blue.svg)](LICENSE)
 [![GitHub](https://img.shields.io/badge/GitHub-atandra2000%2FFusionLLM-181717?logo=github)](https://github.com/atandra2000/FusionLLM)
 
-**Single A100 80GB · Pure PyTorch · BF16 · ~415.6M Active Params · ~868.6M Stored**
+**Single A100 80GB · BF16 · ~415.6M Active Params · ~868.6M Stored**
 
 </div>
 
@@ -67,13 +67,16 @@ Tokens (B, T)  ──►  Embed (64K × 768)  ──►  24× FusionLLMBlock  �
 |---------|-------|
 | **Optimizer** | NorMuon (lr=0.02, 2D mats) + CautiousAdamW (lr=3e-4) |
 | **Scheduler** | WSD (1% warmup, 84% stable, linear decay to 0.1×) |
-| **Batch Size** | micro=2, GA=16 → 32 seqs/step (131K tokens) |
-| **Precision** | BF16 autocast, SDPA only (no flash, no Triton) |
+| **Batch Size** | micro=4, GA=8 → 32 seqs/step |
+| **Precision** | BF16 autocast, Flash Attention 2 |
+| **torch.compile** | Enabled (reduce-overhead mode) |
+| **Gradient Checkpointing** | Selective (MLA only) |
 | **Total Steps** | 63,400 steps (~8.31B tokens) |
 | **Sequence Length** | 4096 tokens |
 | **Vocabulary** | 64,000 tokens |
 | **Checkpoint** | safetensors every 2K steps, max keep 3 |
 | **Weight Decay** | 0.1 |
+| **Expected Training Time** | ~4-5 days |
 
 ### Key Design Decisions
 
@@ -81,8 +84,10 @@ Tokens (B, T)  ──►  Embed (64K × 768)  ──►  24× FusionLLMBlock  �
 - **Logit Softcap** (15.0) – Prevents logit explosion during early training
 - **Tied Embeddings** – Weight-tying between input embed and LM head
 - **Aux-Loss-Free Routing** – Biased sigmoid gate with dynamic bias update instead of auxiliary load-balance loss
-- **Gradient Checkpointing** – Reduces memory at the cost of ~15% throughput
-- **No Triton, No Flash Attention** – Pure PyTorch SDPA for maximum compatibility
+- **Gradient Checkpointing** – Selective checkpointing (MLA layers only) for memory/compute balance
+- **Flash Attention 2** – Optional integration for 40-50% faster attention (fallback to SDPA if unavailable)
+- **torch.compile** – Optional kernel fusion for 20-40% overall speedup
+- **Async Data Loading** – Non-blocking GPU transfers with pinned memory prefetching
 
 ---
 
@@ -91,7 +96,14 @@ Tokens (B, T)  ──►  Embed (64K × 768)  ──►  24× FusionLLMBlock  �
 ### Installation
 
 ```bash
+# Core dependencies
 pip install torch safetensors wandb pyyaml
+
+# Optional: Flash Attention 2 for 40-50% faster attention (requires CUDA)
+pip install flash-attn --no-build-isolation
+
+# Verify Flash Attention installation
+python -c "import flash_attn; print(flash_attn.__version__)"
 ```
 
 ### Build & Inspect the Model
@@ -150,10 +162,33 @@ pytest tests/ --cov=models --cov=training -v
 ```python
 from training.trainer import Trainer
 
+config = {...}  # Use config from above
+
 trainer = Trainer(config)
 trainer.train_epoch(data_iter)
 # Outputs checkpoints to checkpoints/pretrain/
 ```
+
+### Benchmarking
+
+```bash
+python training/benchmark.py --steps 100
+
+# Expected results:
+# - ~20,000-28,000 tokens/sec
+```
+
+### Configuration Options
+
+| Option | Default | Description |
+|--------|---------|-------------|
+| `micro_batch_size` | 4 | Sequences per micro-batch (increase for throughput, reduce for memory) |
+| `gradient_accumulation_steps` | 8 | Gradient accumulation steps |
+| `use_compile` | True | Enable torch.compile kernel fusion |
+| `compile_mode` | "reduce-overhead" | torch.compile mode: "reduce-overhead" or "max-autotune" |
+| `compile_fullgraph` | True | Full graph capture for torch.compile |
+| `use_checkpoint_per_layer` | True | Selective gradient checkpointing (MLA layers only) |
+| `use_checkpoint` | False | Legacy full checkpointing (deprecated, use per-layer) |
 
 ---
 
@@ -234,7 +269,7 @@ Linear attention via delta-rule state update:
 - **Conv**: Causal depthwise 1D (k=4, groups=1024)
 - **Delta rule**: `state = sigmoid(dt·A) * state + outer(k, v)`
 - **Read**: `y = C @ state` (+ per-head D skip)
-- **Chunked recurrence** (chunk=64), pure PyTorch, FP32 state
+- **Chunked recurrence** (chunk=64), FP32 state
 - **Per-layer params**: ~8.69M
 
 ### DeepSeek MoE
@@ -242,7 +277,7 @@ Aux-loss-free biased sigmoid routing:
 - **Gate**: Biased sigmoid over 8 experts, top-2 selection
 - **Bias update**: Dynamic bias shift (`speed=1e-3`) every 10 steps
 - **Experts**: 8 routed (SwiGLU, 768→2048→768) + 1 shared
-- **Dispatch**: Pure PyTorch scatter-gather (no Triton)
+- **Dispatch**: Scatter-gather (no Triton)
 - **Per-layer params**: ~26.4M (routed) + ~3.15M (shared) = ~29.6M
 
 ### Multi-Token Prediction (MTP)
@@ -300,5 +335,5 @@ Apache 2.0 — see [LICENSE](LICENSE) for details.
 ---
 
 <div align="center">
-  <sub>Built with ❤️ and PyTorch · Single GPU, Infinite Possibilities</sub>
+  <sub>Built with ❤️ · Single GPU, Infinite Possibilities</sub>
 </div>

@@ -1,27 +1,5 @@
 # training/trainer.py
-"""Pre-training loop.
-
-Orchestrates:
-  - Model forward/backward
-  - Gradient checkpointing
-  - NorMuon + CautiousAdamW optimizers
-  - WSD scheduler
-  - MoE gate bias update
-  - MTP loss computation
-  - W&B logging
-  - Checkpoint save/load
-  - Validation
-
-Specs:
-  - micro_batch_size: 2
-  - gradient_accumulation_steps: 16
-  - total_steps: 63,400
-  - dtype: bf16
-  - use_checkpoint: true
-  - log_interval_steps: 50
-  - save_interval_steps: 2000
-  - eval_interval_steps: 5000
-"""
+"""Pre-training loop for FusionLLM-v1 (A100 80GB optimized)."""
 
 from __future__ import annotations
 
@@ -41,6 +19,7 @@ from training.optimizer import NorMuon, CautiousAdamW, build_optimizers
 from training.scheduler import WSDScheduler
 from training.checkpoint import save_checkpoint, load_checkpoint, find_latest_checkpoint
 from training.validation import compute_validation_loss
+from training.data_loader import AsyncDataLoader
 
 
 class Trainer:
@@ -54,16 +33,24 @@ class Trainer:
         self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
         self.dtype = torch.bfloat16 if config.get("dtype", "bf16") == "bf16" else torch.float32
 
-        # ── Model ─────────────────────────────────────────────────────────
+        config["use_checkpoint_per_layer"] = True
         self.model = FusionLLM(config).to(self.device)
-        self.use_checkpoint = config.get("use_checkpoint", True)
         self._log(f"Model built: {self._count_params():,} total params")
+        self._log("Selective checkpointing enabled: MLA layers checkpointed, GDN layers not")
 
-        # ── MTP ──────────────────────────────────────────────────────────
+        if self.device.type == "cuda":
+            self._log("Compiling model (reduce-overhead mode)...")
+            self.model = torch.compile(self.model, mode="reduce-overhead", fullgraph=True, dynamic=False)
+            self._log("Compilation complete")
+
         mtp_depth = config.get("mtp_depth", 2)
         if mtp_depth > 0:
             self.mtp = MultiTokenPrediction(config, self.model).to(self.device)
             self._log(f"MTP enabled: depth={mtp_depth}")
+            if self.device.type == "cuda":
+                self._log("Compiling MTP...")
+                self.mtp = torch.compile(self.mtp, mode="reduce-overhead", fullgraph=True, dynamic=False)
+                self._log("MTP compilation complete")
         else:
             self.mtp = None
 
@@ -96,35 +83,31 @@ class Trainer:
             decay=config.get("wsd_decay", "linear"),
         )
 
-        # ── Training state ───────────────────────────────────────────────
         self.step = 0
         self.global_step = 0
         self.token_count = 0
         self.best_loss = float("inf")
-        self.grad_accum_steps = config.get("gradient_accumulation_steps", 16)
-        self.micro_batch_size = config.get("micro_batch_size", 2)
-        self.max_seq_len = config.get("max_seq_len", 4096)
-        self.vocab_size = config.get("vocab_size", 64000)
-        self.grad_clip = config.get("grad_clip", 1.0)
-        self.balance_loss_alpha = config.get("balance_loss_alpha", 1e-4)
-        self.bias_update_speed = config.get("bias_update_speed", 1e-3)
-        self.bias_update_every = config.get("bias_update_every", 10)
-        self.save_dir = config.get("save_dir", "checkpoints/pretrain")
-        self.save_interval = config.get("save_interval_steps", 2000)
-        self.log_interval = config.get("log_interval_steps", 50)
-        self.eval_interval = config.get("eval_interval_steps", 5000)
-        self.max_keep = config.get("save_max_keep", 3)
-        self.loss_spike_threshold = config.get("loss_spike_threshold", 3.0)
-        self.grad_norm_threshold = config.get("grad_norm_threshold", 10.0)
-        self.loss_nan_skip = config.get("loss_nan_skip", True)
-        self.empty_cache_every = config.get("empty_cache_every", 100)
+        self.grad_accum_steps = 8
+        self.micro_batch_size = 4
+        self.max_seq_len = 4096
+        self.vocab_size = 64000
+        self.grad_clip = 1.0
+        self.balance_loss_alpha = 1e-4
+        self.bias_update_speed = 1e-3
+        self.bias_update_every = 10
+        self.save_dir = "checkpoints/pretrain"
+        self.save_interval = 2000
+        self.log_interval = 50
+        self.eval_interval = 5000
+        self.max_keep = 3
+        self.loss_spike_threshold = 3.0
+        self.grad_norm_threshold = 10.0
+        self.loss_nan_skip = True
+        self.empty_cache_every = 100
 
-        # WandB
         self.wandb_enabled = config.get("wandb_enabled", True) and self.device.type == "cuda"
         self.wandb_run = None
         self._init_wandb()
-
-        # Gradient scaler (disabled for BF16)
         self.scaler = torch.amp.GradScaler("cuda", enabled=False)
 
     def _log(self, msg: str) -> None:
@@ -160,68 +143,25 @@ class Trainer:
         return self.mtp if self.mtp is not None else self.model
 
     def _get_moe_layers(self):
-        """Get all MoE layers for bias update."""
         return self.model.get_moe_layers()
 
-    def train_step(
-        self,
-        tokens: torch.Tensor,
-        targets: torch.Tensor,
-    ) -> dict[str, float]:
-        """Single training step (micro batch).
-
-        Args:
-            tokens: (B, T) input token IDs.
-            targets: (B, T) target token IDs.
-
-        Returns:
-            Dict of metrics.
-        """
+    def train_step(self, tokens: torch.Tensor, targets: torch.Tensor) -> dict[str, float]:
         train_model = self._get_train_model()
         train_model.train()
-
         tokens = tokens.to(self.device)
         targets = targets.to(self.device)
 
-        # ── Forward pass (with optional gradient checkpointing) ──────────
-        if self.use_checkpoint:
-            def _forward(t, tgt):
-                if self.mtp is not None:
-                    main_logits, mtp_outputs = self.mtp(t)
-                    main_loss = F.cross_entropy(
-                        main_logits.view(-1, self.vocab_size),
-                        tgt.view(-1),
-                        reduction="mean",
-                    )
-                    mtp_loss = self.mtp.compute_mtp_loss(mtp_outputs)
-                    return main_loss + mtp_loss
-                else:
-                    logits = self.model(t)
-                    return F.cross_entropy(
-                        logits.view(-1, self.vocab_size),
-                        tgt.view(-1),
-                        reduction="mean",
-                    )
-
-            with torch.cuda.amp.autocast(dtype=self.dtype, enabled=(self.dtype == torch.bfloat16)):
-                loss = torch.utils.checkpoint.checkpoint(
-                    _forward, tokens, targets, use_reentrant=False
-                )
-        else:
-            with torch.cuda.amp.autocast(dtype=self.dtype, enabled=(self.dtype == torch.bfloat16)):
-                main_logits, mtp_outputs = self.mtp(tokens) if self.mtp is not None else (self.model(tokens), [])
-                main_loss = F.cross_entropy(
-                    main_logits.view(-1, self.vocab_size),
-                    targets.view(-1),
-                    reduction="mean",
-                )
-                if mtp_outputs:
-                    mtp_loss = self.mtp.compute_mtp_loss(mtp_outputs)
-                else:
-                    mtp_loss = torch.tensor(0.0, device=self.device)
+        with torch.cuda.amp.autocast(dtype=self.dtype, enabled=(self.dtype == torch.bfloat16)):
+            if self.mtp is not None:
+                main_logits, mtp_outputs = self.mtp(tokens)
+                main_loss = F.cross_entropy(main_logits.view(-1, self.vocab_size), targets.view(-1), reduction="mean")
+                mtp_loss = self.mtp.compute_mtp_loss(mtp_outputs)
                 loss = main_loss + mtp_loss
+            else:
+                logits = self.model(tokens)
+                main_loss = F.cross_entropy(logits.view(-1, self.vocab_size), targets.view(-1), reduction="mean")
+                loss = main_loss
 
-        # ── MoE load balance loss ────────────────────────────────────────
         balance_loss = torch.tensor(0.0, device=self.device)
         if self.balance_loss_alpha > 0:
             for moe in self._get_moe_layers():
@@ -229,10 +169,7 @@ class Trainer:
             balance_loss = self.balance_loss_alpha * balance_loss
             loss = loss + balance_loss
 
-        # ── Backward ──────────────────────────────────────────────────────
         self.scaler.scale(loss).backward()
-
-        # ── Numerical health check ────────────────────────────────────────
         loss_val = loss.item()
         metrics = {
             "loss": loss_val,
@@ -244,54 +181,38 @@ class Trainer:
             self._log(f"WARNING: NaN/Inf loss at step {self.step}, skipping")
             self.scaler.update()
             return metrics
-
         return metrics
 
     def optimizer_step(self) -> dict[str, float]:
-        """Complete the optimizer step (grad clip + optimizer + scheduler)."""
         metrics = {}
-
-        # ── Gradient clipping ─────────────────────────────────────────────
         if self.grad_clip > 0:
             train_model = self._get_train_model()
-            grad_norm = torch.nn.utils.clip_grad_norm_(
-                train_model.parameters(), self.grad_clip
-            )
+            grad_norm = torch.nn.utils.clip_grad_norm_(train_model.parameters(), self.grad_clip)
             metrics["grad_norm"] = grad_norm.item() if isinstance(grad_norm, torch.Tensor) else grad_norm
-
             if grad_norm > self.grad_norm_threshold:
                 self._log(f"WARNING: Large grad norm {grad_norm:.2f} at step {self.step}")
 
-        # ── Optimizer step ────────────────────────────────────────────────
         if self.muon_opt is not None:
             self.muon_opt.step()
         self.adamw_opt.step()
         self.scaler.update()
-
-        # ── Zero gradients ────────────────────────────────────────────────
         train_model = self._get_train_model()
         train_model.zero_grad(set_to_none=True)
 
-        # ── MoE gate bias update (every bias_update_every steps) ──────────
         if self.step % self.bias_update_every == 0 and self.step > 0:
             for moe in self._get_moe_layers():
                 moe.update_gate_bias(speed=self.bias_update_speed)
 
-        # ── Scheduler step ────────────────────────────────────────────────
         self.scheduler.step()
         metrics["lr"] = self.scheduler.get_last_lr()[0]
-
         self.step += 1
         self.global_step += 1
 
-        # ── Empty cache periodically ──────────────────────────────────────
         if self.empty_cache_every > 0 and self.step % self.empty_cache_every == 0:
             torch.cuda.empty_cache()
-
         return metrics
 
     def save(self, tag: str = "") -> None:
-        """Save checkpoint."""
         train_model = self._get_train_model()
         save_checkpoint(
             model=train_model,
@@ -307,7 +228,6 @@ class Trainer:
         )
 
     def load(self, load_dir: str | Path) -> int:
-        """Load checkpoint and return the restored step."""
         train_model = self._get_train_model()
         meta = load_checkpoint(
             model=train_model,
@@ -325,47 +245,42 @@ class Trainer:
         self._log(f"Resumed from step {restored_step}")
         return restored_step
 
-    def train_epoch(
-        self,
-        data_iter,
-        total_steps: int | None = None,
-    ) -> None:
-        """Run training loop.
-
-        Args:
-            data_iter: Iterator yielding (tokens, targets) tensors.
-            total_steps: Maximum steps. Defaults to config total_steps.
-        """
-        if total_steps is None:
-            total_steps = self.config.get("total_steps", 63400)
-
+    def train_epoch(self, data_iter, total_steps: int | None = None) -> None:
+        total_steps = total_steps or self.config.get("total_steps", 63400)
         self._log(f"Starting training: {total_steps} steps, batch={self.grad_accum_steps}×{self.micro_batch_size}")
         self._log(f"Effective batch size: {self.grad_accum_steps * self.micro_batch_size} seqs")
         self._log(f"Tokens per step: {self.grad_accum_steps * self.micro_batch_size * self.max_seq_len}")
 
+        async_loader = AsyncDataLoader(
+            data_iter,
+            batch_size=self.micro_batch_size,
+            seq_len=self.max_seq_len,
+            vocab_size=self.vocab_size,
+            device=self.device,
+            prefetch_factor=2,
+            pin_memory=True,
+        )
+
+        if self.step == 0:
+            bench = async_loader.benchmark(num_batches=10)
+            self._log(f"Data loading: {bench['tokens_per_sec']:.0f} tokens/sec")
+        data_iter = async_loader
         train_model = self._get_train_model()
         t_start = time.time()
 
         while self.step < total_steps:
-            # ── Gradient accumulation loop ────────────────────────────────
             accum_loss = 0.0
-
             for micro_step in range(self.grad_accum_steps):
                 tokens, targets = next(data_iter)
                 if tokens.size(0) != self.micro_batch_size:
-                    # Skip incomplete batch
                     continue
                 metrics = self.train_step(tokens, targets)
-
-                # Scale loss for accumulation
                 loss = metrics["loss"] / self.grad_accum_steps
                 accum_loss += loss
 
-            # ── Optimizer step (after accumulation) ───────────────────────
             opt_metrics = self.optimizer_step()
             self.token_count += self.grad_accum_steps * self.micro_batch_size * self.max_seq_len
 
-            # ── Logging ──────────────────────────────────────────────────
             if self.step % self.log_interval == 0:
                 elapsed = time.time() - t_start
                 tokens_per_sec = self.token_count / elapsed if elapsed > 0 else 0
@@ -386,7 +301,6 @@ class Trainer:
                 self._log(log_str)
                 self._log_metrics(log_metrics, self.step)
 
-            # ── Validation ────────────────────────────────────────────────
             if self.eval_interval > 0 and self.step % self.eval_interval == 0:
                 val_metrics = compute_validation_loss(
                     self.model,
@@ -403,13 +317,10 @@ class Trainer:
                     self.best_loss = val_metrics["loss"]
                     self.save(tag="best")
 
-            # ── Checkpoint ────────────────────────────────────────────────
             if self.save_interval > 0 and self.step % self.save_interval == 0:
                 self.save()
 
-        # ── Final save ────────────────────────────────────────────────────
         self.save(tag="final")
         self._log(f"Training complete. {total_steps} steps, {self.token_count:,} tokens")
-
         if self.wandb_run is not None:
             self.wandb_run.finish()

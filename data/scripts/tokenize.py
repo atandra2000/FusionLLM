@@ -1,17 +1,4 @@
 # data/scripts/tokenize.py
-# Stage 4: tokenize data/clean/<source>/shard_*.jsonl.zst into
-# data/tokens/<source>/tokens_*.bin (uint16 LE).
-#
-# Output of this stage is a per-source, sequential stream of uint16 token
-# IDs, with each document terminated by EOS_ID (0). The shard_writer stage
-# reads these files in deterministic order and packs them into
-# seq_len=4096 sequences.
-#
-# Simplification vs the original plan:
-#   * No global MinHash dedup (the corpus is large enough that small
-#     duplication is acceptable; we'd rather spend the time training).
-#   * No intra-shard simhash.
-#   * Single-process, ordered by source. Parallelism lives in shard_writer.
 
 from __future__ import annotations
 
@@ -35,27 +22,19 @@ from data.common import (
     seed_everything,
 )
 
-# Cap on tokens per output .bin file (~512 MB at uint16 = 256 M tokens)
 TOKENS_PER_FILE = 256_000_000
 
 
 def _open_spm() -> spm.SentencePieceProcessor:
     model_path = TOKENIZER_DIR / "tokenizer.model"
     if not model_path.exists():
-        raise FileNotFoundError(
-            f"Tokenizer not found at {model_path}. Run train_tokenizer.py first."
-        )
+        raise FileNotFoundError(f"Tokenizer not found at {model_path}")
     sp = spm.SentencePieceProcessor()
     sp.Load(str(model_path))
     return sp
 
 
-def _tokenize_source(
-    source_id: str,
-    sp: spm.SentencePieceProcessor,
-    state: dict,
-) -> int:
-    """Tokenize one source. Returns the number of tokens written."""
+def _tokenize_source(source_id: str, sp: spm.SentencePieceProcessor, state: dict) -> int:
     in_files = list(iter_clean_shards(source_id))
     if not in_files:
         log(f"[{source_id}] no clean files; skipping")
@@ -76,8 +55,6 @@ def _tokenize_source(
     buf_pos = 0
     total_new = 0
 
-    # Buffers for the encode call: SPM works in pieces, but a single encode
-    # call is faster than many small ones for our throughput regime.
     log(f"[{source_id}] starting in_idx={in_idx} in_doc={in_doc} out_idx={out_idx}")
 
     for fi in range(in_idx, len(in_files)):
@@ -92,12 +69,9 @@ def _tokenize_source(
             ids = sp.EncodeAsIds(text)
             if not ids:
                 continue
-            # Append EOS
             ids.append(EOS_ID)
 
             n = len(ids)
-            # If this doc is bigger than the file buffer, flush what we have
-            # and write the doc straight from a contiguous numpy array.
             if n > TOKENS_PER_FILE:
                 if buf_pos > 0:
                     out_f.write(buf[:buf_pos].tobytes())
@@ -119,7 +93,7 @@ def _tokenize_source(
                 tokens_written += n
                 total_new += n
 
-            if total_new % 5_000_000 < n:  # save state ~every 5M tokens
+            if total_new % 5_000_000 < n:
                 src_state.update(
                     out_idx=out_idx,
                     in_idx=fi,
@@ -132,7 +106,6 @@ def _tokenize_source(
         out_f.write(buf[:buf_pos].tobytes())
     out_f.close()
 
-    # If the last file is empty, delete it
     if buf_pos == 0 and out_path.exists() and out_idx > 0:
         out_path.unlink()
         out_idx -= 1
@@ -144,12 +117,12 @@ def _tokenize_source(
         tokens_written=tokens_written,
     )
     save_state("tokenize", state)
-    log(f"[{source_id}] wrote {total_new:,} tokens across {out_idx + 1} file(s) in {out_dir}")
+    log(f"[{source_id}] wrote {total_new:,} tokens across {out_idx + 1} file(s)")
     return total_new
 
 
 def main(argv: list[str] | None = None) -> int:
-    parser = argparse.ArgumentParser(description="Stage 4: tokenize clean jsonl.zst -> uint16 token files")
+    parser = argparse.ArgumentParser(description="Stage 4: tokenize clean jsonl.zst")
     parser.add_argument("--config", default="data/config/mixture.yaml")
     parser.add_argument("--source", default=None)
     args = parser.parse_args(argv)
@@ -157,9 +130,7 @@ def main(argv: list[str] | None = None) -> int:
     seed_everything()
     mixture = load_yaml(args.config)
     sp = _open_spm()
-    state = load_state("tokenize")
 
-    # Quick sanity check on the tokenizer
     if sp.GetPieceSize() != 64000:
         log(f"WARNING: tokenizer vocab size is {sp.GetPieceSize()}, expected 64000")
 
@@ -169,7 +140,7 @@ def main(argv: list[str] | None = None) -> int:
         try:
             _tokenize_source(spec["id"], sp, state)
         except KeyboardInterrupt:
-            log("Interrupted. State saved; rerun to resume.")
+            log("Interrupted. State saved.")
             return 130
         except Exception as e:
             log(f"[{spec['id']}] ERROR: {type(e).__name__}: {e}")

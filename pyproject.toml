@@ -82,4 +82,6 @@ markers = [
 filterwarnings = [
     "error",
     "ignore::DeprecationWarning:torch.*",
+    "ignore::FutureWarning",
+    "ignore::UserWarning",
 ]

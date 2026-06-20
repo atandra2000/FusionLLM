@@ -9,9 +9,11 @@
 [![License](https://img.shields.io/badge/License-Apache_2.0-blue.svg)](LICENSE)
 [![Code Style](https://img.shields.io/badge/code%20style-ruff-3B82F6)](https://github.com/astral-sh/ruff)
 
-**Hardware:** Single A100 80GB &nbsp;·&nbsp; **Precision:** BF16 &nbsp;·&nbsp; **Active Parameters:** 415.6M &nbsp;·&nbsp; **Stored Parameters:** 868.6M &nbsp;·&nbsp; **Training Tokens:** 8.31B
+**Hardware:** Single A100 80GB &nbsp;·&nbsp; **Precision:** BF16 &nbsp;·&nbsp; **Active Parameters:** 415.6M &nbsp;·&nbsp; **Stored Parameters:** 868.6M &nbsp;·&nbsp; **Training Tokens:** 8.31B (planned)
 
 </div>
+
+> **Status:** Architecture, training framework, data pipeline, and unit-test suite are implemented; the full 8.31B-token pretraining run has not yet started.
 
 ---
 

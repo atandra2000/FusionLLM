@@ -68,7 +68,144 @@ The framework is implemented entirely in **pure PyTorch** (≥2.5) with `torch.c
 
 ## Architecture
 
+### System Overview
+
+```mermaid
+flowchart TB
+    subgraph IN["Inputs"]
+        T1["Tokens<br/>B × T"]:::input
+    end
+    subgraph EMB["Embedding"]
+        E1["Token Embedding<br/>64K × 768<br/>(tied with LM head)"]:::embed
+    end
+    subgraph FUSION["24× FusionLLMBlock · alternating MLA ↔ GDN"]
+        direction TB
+        F1["RMSNorm"]:::norm
+        F2["Attention Block<br/>MLA  |  GDN"]:::attn
+        F3["Residual Add"]:::add
+        F4["RMSNorm"]:::norm
+        F5["FFN Block<br/>DeepSeekMoE  |  SwiGLU"]:::ffn
+        F6["Residual Add"]:::add
+    end
+    subgraph HEAD["Prediction Heads"]
+        H1["Final RMSNorm"]:::norm
+        H2["LM Head (tied)<br/>Logit softcap ±15.0"]:::head
+        H3["MTP Heads (depth 2, 3)<br/>λ₂=0.10, λ₃=0.05"]:::mtp
+    end
+    T1 --> E1 --> F1 --> F2 --> F3 --> F4 --> F5 --> F6 --> H1 --> H2
+    H2 --> H3
+
+    classDef input fill:#e0e7ff,stroke:#3730a3,color:#000
+    classDef embed fill:#fef3c7,stroke:#92400e,color:#000
+    classDef norm fill:#f3f4f6,stroke:#374151,color:#000
+    classDef attn fill:#dbeafe,stroke:#1d4ed8,color:#000
+    classDef ffn fill:#fce7f3,stroke:#9d174d,color:#000
+    classDef add fill:#f3f4f6,stroke:#374151,color:#000
+    classDef head fill:#bbf7d0,stroke:#15803d,color:#000
+    classDef mtp fill:#fed7aa,stroke:#9a3412,color:#000
+    class T1 input
+    class E1 embed
+    class F1,F4,H1 norm
+    class F2 attn
+    class F5 ffn
+    class F3,F6 add
+    class H2 head
+    class H3 mtp
+```
+
+### 24-Layer Alternating Schedule
+
+```mermaid
+graph LR
+    L0["L0 MLA+MoE"]:::mla
+    L1["L1 MLA+MoE"]:::mla
+    L2["L2 GDN+SwiGLU"]:::gdn
+    L3["L3 MLA+MoE"]:::mla
+    L4["L4 MLA+MoE"]:::mla
+    L5["L5 GDN+SwiGLU"]:::gdn
+    L6["L6 MLA+MoE"]:::mla
+    L7["L7 MLA+MoE"]:::mla
+    L8["L8 GDN+SwiGLU"]:::gdn
+    L9["L9 MLA+MoE"]:::mla
+    L10["L10 MLA+MoE"]:::mla
+    L11["L11 GDN+SwiGLU"]:::gdn
+    L12["L12 MLA+MoE"]:::mla
+    L13["L13 MLA+MoE"]:::mla
+    L14["L14 GDN+SwiGLU"]:::gdn
+    L15["L15 MLA+MoE"]:::mla
+    L16["L16 MLA+MoE"]:::mla
+    L17["L17 GDN+SwiGLU"]:::gdn
+    L18["L18 MLA+MoE"]:::mla
+    L19["L19 MLA+MoE"]:::mla
+    L20["L20 GDN+SwiGLU"]:::gdn
+    L21["L21 MLA+MoE"]:::mla
+    L22["L22 MLA+MoE"]:::mla
+    L23["L23 GDN+SwiGLU"]:::gdn
+    L0-->L1-->L2-->L3-->L4-->L5-->L6-->L7-->L8-->L9-->L10-->L11-->L12-->L13-->L14-->L15-->L16-->L17-->L18-->L19-->L20-->L21-->L22-->L23
+    classDef mla fill:#dbeafe,stroke:#1d4ed8,color:#000
+    classDef gdn fill:#fce7f3,stroke:#9d174d,color:#000
+```
+
+16 MLA&nbsp;+&nbsp;MoE layers and 8 GDN&nbsp;+&nbsp;dense SwiGLU layers, interleaved to maximise the strengths of both attention mechanisms.
+
+### Hybrid Block &mdash; what each layer looks like
+
+```mermaid
+flowchart LR
+    X["x"]:::in --> RN1["RMSNorm"] --> A["MLA<br/>Q LoRA 192, KV rank 96<br/>decoupled RoPE"]:::attn --> ADD1["+"]:::add --> RN2["RMSNorm"]
+    RN2 --> M["DeepSeekMoE<br/>8 routed (top-2) + 1 shared<br/>aux-loss-free biased-sigmoid"]:::moe --> ADD2["+"]:::add --> OUT["out"]:::out
+    X -. residual .-> ADD1
+    ADD1 -. residual .-> ADD2
+
+    classDef in fill:#e0e7ff,stroke:#3730a3,color:#000
+    classDef out fill:#e0e7ff,stroke:#3730a3,color:#000
+    classDef add fill:#f3f4f6,stroke:#374151,color:#000
+    classDef attn fill:#dbeafe,stroke:#1d4ed8,color:#000
+    classDef moe fill:#fce7f3,stroke:#9d174d,color:#000
+```
+
+> The GDN variant swaps MLA for **Gated Delta Net** (32 heads, chunk=64) and MoE for a **dense SwiGLU FFN**.
+
+### Dual Optimizer Routing
+
+```mermaid
+flowchart LR
+    P["All Trainable Params"]:::p
+    P --> MAT["2D matrices<br/>attention, FFN, head weights"]:::nm
+    P --> VEC["1D params<br/>RMSNorm γ, biases, embeddings"]:::ad
+
+    MAT -->|"lr 0.02"| NOR["NorMuon"]:::nm2
+    VEC -->|"lr 3e-4"| ADA["CautiousAdamW"]:::ad2
+
+    NOR --> STEP["Step"]
+    ADA --> STEP
+
+    classDef p fill:#f3f4f6,stroke:#374151,color:#000
+    classDef nm fill:#dbeafe,stroke:#1d4ed8,color:#000
+    classDef nm2 fill:#bfdbfe,stroke:#1e40af,color:#000
+    classDef ad fill:#fce7f3,stroke:#9d174d,color:#000
+    classDef ad2 fill:#fbcfe8,stroke:#831843,color:#000
+```
+
+Mixing the two optimizers silently degrades training. The split is enforced in `training/optimizer.py`.
+
+### 6-Stage Data Pipeline
+
+```mermaid
+flowchart LR
+    S1["1. Download<br/>FineWeb-Edu 55% · FineWeb 20%<br/>Stack Py 10% · SlimPajama 8%<br/>Dolma Wiki 4% · Dolma Books 3%"]:::stage
+    S2["2. Preprocess<br/>text clean, language filter"]:::stage
+    S3["3. 64K BPE Tokenizer<br/>trained from scratch"]:::stage
+    S4["4. Tokenize<br/>uint32 stream"]:::stage
+    S5["5. Shard<br/>4096 × 4096 mmap"]:::stage
+    S6["6. Streaming Loader<br/>resume-friendly"]:::stage
+    S1-->S2-->S3-->S4-->S5-->S6
+
+    classDef stage fill:#ecfeff,stroke:#0e7490,color:#000
+```
+
 ### Model Topology
+
 
 ```
 Tokens (B, T)
@@ -300,6 +437,23 @@ pytest tests/ -m "gpu"
 ```
 
 ---
+
+
+### Component Dependency Graph
+
+```mermaid
+graph TD
+    EMB["Embedding<br/>tied"] --> MLA --> MOE
+    EMB --> GDN --> SWI["SwiGLU FFN<br/>(dense path)"]
+    MLA --> NORM["RMSNorm"] --> MTP["MTP Heads<br/>depth 2, 3"]
+    MOE --> NORM
+    SWI --> NORM
+    NORM --> HEAD["LM Head<br/>softcap ±15"]
+    MLA ---|"Q LoRA 192<br/>KV rank 96"| ABS["Absorption Trick<br/>W_Q @ W_UK"]
+    MOE ---|"aux-loss-free<br/>biased-sigmoid"| GATE["Gate Routing"]
+    GDN ---|"chunk=64<br/>FP32 recurrent state"| REC["Recurrent State"]
+    MTP ---|"shared head"| HEAD
+```
 
 ## Component Deep-Dive
 

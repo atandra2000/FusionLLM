@@ -8,11 +8,6 @@ import torch.nn as nn
 from torch.optim import Optimizer
 
 
-# ─────────────────────────────────────────────────────────────────────────────
-# NorMuon Optimizer
-# ─────────────────────────────────────────────────────────────────────────────
-
-
 class NorMuon(Optimizer):
     """NorMuon: orthogonalized Adam with per-row RMS normalization."""
 
@@ -61,11 +56,6 @@ class NorMuon(Optimizer):
 
                 p.add_(update, alpha=-lr)
         return loss
-
-
-# ─────────────────────────────────────────────────────────────────────────────
-# CautiousAdamW Optimizer
-# ─────────────────────────────────────────────────────────────────────────────
 
 
 def _cautious_mask(grad: torch.Tensor, weight: torch.Tensor) -> torch.Tensor:
@@ -118,11 +108,6 @@ class CautiousAdamW(Optimizer):
 
                 p.add_(update, alpha=-lr)
         return loss
-
-
-# ─────────────────────────────────────────────────────────────────────────────
-# Optimizer Builder
-# ─────────────────────────────────────────────────────────────────────────────
 
 
 def build_optimizers(model: nn.Module, adamw_lr: float = 3e-4, muon_lr: float = 0.02, muon_momentum: float = 0.95, adamw_betas: tuple[float, float] = (0.9, 0.95), weight_decay: float = 0.1, cautious_wd: bool = True) -> tuple[NorMuon | None, CautiousAdamW]:

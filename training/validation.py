@@ -1,12 +1,5 @@
 # training/validation.py
-"""Validation and evaluation.
-
-Specs:
-  - eval_enabled: true
-  - eval_interval_steps: 5000
-  - eval_max_batches: 8
-  - eval_synthetic: true
-"""
+"""Validation loss and perplexity on synthetic data."""
 
 from __future__ import annotations
 
@@ -36,19 +29,7 @@ def compute_validation_loss(
     num_batches: int = 8,
     device: torch.device = torch.device("cpu"),
 ) -> dict[str, float]:
-    """Compute validation loss and perplexity on synthetic data.
-
-    Args:
-        model: The model (should be in eval mode).
-        batch_size: Micro batch size for validation.
-        seq_len: Sequence length.
-        vocab_size: Vocabulary size.
-        num_batches: Number of batches to average over.
-        device: Device to run on.
-
-    Returns:
-        dict with "loss" and "ppl".
-    """
+    """Compute validation loss and perplexity on synthetic data."""
     model.eval()
     total_loss = 0.0
     total_tokens = 0
@@ -58,7 +39,7 @@ def compute_validation_loss(
             batch_size, seq_len, vocab_size, device
         )
 
-        logits = model(tokens)  # (B, T, V)
+        logits = model(tokens)
 
         loss = F.cross_entropy(
             logits.view(-1, vocab_size),
@@ -87,10 +68,7 @@ def validate_forward_shape(
     seq_len: int = 4096,
     device: torch.device = torch.device("cpu"),
 ) -> None:
-    """Validate that forward pass produces correct output shape.
-
-    Raises AssertionError on mismatch.
-    """
+    """Validate that forward pass produces correct output shape."""
     model.eval()
     tokens = torch.randint(0, 64000, (batch_size, seq_len), device=device)
     logits = model(tokens)

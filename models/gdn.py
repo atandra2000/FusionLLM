@@ -58,7 +58,7 @@ class GatedDeltaNet(nn.Module):
         return self.out_proj(y * g * F.silu(z))
 
     def _chunked_delta_rule(self, v: torch.Tensor, dt: torch.Tensor, A: torch.Tensor, B: torch.Tensor, C: torch.Tensor) -> torch.Tensor:
-        """Chunked delta-rule recurrence (FP32 state)."""
+        """Chunked delta-rule recurrence."""
         B_sz, T, n_heads, headdim = v.shape
         d_state = B.size(-1)
         chunk_size = self.chunk_size

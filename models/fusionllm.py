@@ -37,7 +37,6 @@ class FusionLLMBlock(nn.Module):
         self.is_gdn = is_gdn
         self.use_checkpoint = not is_gdn
 
-        # Pre-attention norm
         self.norm1 = nn.RMSNorm(config["dim"], eps=1e-6)
 
         if is_gdn:
@@ -47,7 +46,6 @@ class FusionLLMBlock(nn.Module):
             self.attn = MultiHeadLatentAttention(config, layer_idx=layer_idx)
             self.ffn = DeepSeekMoE(config)
 
-        # Pre-FFN norm
         self.norm2 = nn.RMSNorm(config["dim"], eps=1e-6)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:

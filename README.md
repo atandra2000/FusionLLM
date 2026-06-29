@@ -15,6 +15,8 @@
 
 > **Status:** Architecture, training framework, data pipeline, and unit-test suite are implemented; the full 8.31B-token pretraining run has not yet started.
 
+> **Docs:** Conceptual rationale lives in [`documentation/`](documentation/README.md).
+
 ---
 
 ## Table of Contents

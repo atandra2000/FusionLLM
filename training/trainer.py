@@ -23,10 +23,7 @@ from training.data_loader import AsyncDataLoader
 
 
 class Trainer:
-    """Pre-training orchestrator for FusionLLM.
-
-    Single-GPU training (A100 80GB). BF16 autocast.
-    """
+    """Pre-training orchestrator for FusionLLM-v1 (A100 80GB, BF16)."""
 
     def __init__(self, config: dict):
         self.config = config
@@ -54,7 +51,7 @@ class Trainer:
         else:
             self.mtp = None
 
-        # ── Optimizers ───────────────────────────────────────────────────
+        # Optimizers
         train_model = self.mtp if self.mtp is not None else self.model
         self.muon_opt, self.adamw_opt = build_optimizers(
             train_model,
@@ -66,7 +63,7 @@ class Trainer:
             cautious_wd=config.get("cautious_wd", True),
         )
 
-        # ── Scheduler ────────────────────────────────────────────────────
+        # Scheduler
         total_steps = config.get("total_steps", 63400)
         warmup_frac = config.get("wsd_warmup_frac", 0.01)
         stable_frac = config.get("wsd_stable_frac", 0.84)

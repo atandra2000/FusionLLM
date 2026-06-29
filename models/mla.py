@@ -117,17 +117,16 @@ class MultiHeadLatentAttention(nn.Module):
         q_concat = self.q_norm_qk(q_concat)
         k_concat = self.k_norm_qk(k_concat)
 
-        # Flash Attention 2 (with SDPA fallback)
         if flash_attn_func is not None:
-            q_fa = q_concat.transpose(1, 2)  # (B, T, 12, 128)
-            k_fa = k_concat.transpose(1, 2)  # (B, T, 12, 128)
-            v_fa = v.transpose(1, 2)         # (B, T, 12, 64)
+            q_fa = q_concat.transpose(1, 2)
+            k_fa = k_concat.transpose(1, 2)
+            v_fa = v.transpose(1, 2)
             attn_out = flash_attn_func(q_fa, k_fa, v_fa, dropout_p=0.0, causal=True)
             attn_out = attn_out.transpose(1, 2).contiguous().view(B, T, -1)
         else:
-            q_fa = q_concat.transpose(1, 2)  # (B, n_heads, T, qk_head_dim)
-            k_fa = k_concat.transpose(1, 2)  # (B, n_heads, T, qk_head_dim)
-            v_fa = v.transpose(1, 2)         # (B, n_heads, T, v_head_dim)
+            q_fa = q_concat.transpose(1, 2)
+            k_fa = k_concat.transpose(1, 2)
+            v_fa = v.transpose(1, 2)
             attn_out = torch.nn.functional.scaled_dot_product_attention(q_fa, k_fa, v_fa, is_causal=True)
             attn_out = attn_out.transpose(1, 2).contiguous().view(B, T, -1)
         return self.wo(attn_out)

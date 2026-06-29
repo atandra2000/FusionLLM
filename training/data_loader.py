@@ -10,14 +10,8 @@ import torch
 
 
 class AsyncDataLoader:
-    """Async data loader with prefetching for training.
-    
-    Wraps an existing data iterator to provide:
-    - Non-blocking GPU transfers
-    - Optional prefetching
-    - Throughput benchmarking
-    """
-    
+    """Async data loader with non-blocking GPU transfers and optional prefetching."""
+
     def __init__(
         self,
         data_iter: Iterator,
@@ -37,54 +31,44 @@ class AsyncDataLoader:
         self.batch_size = batch_size
         self.seq_len = seq_len
         self.vocab_size = vocab_size
-        
-        # Prefetch stream
+
         self._prefetch_queue = None
-        
+
     def _create_prefetch_iterator(self):
         """Create background prefetching."""
         def generator():
             while True:
                 try:
                     tokens, targets = next(self.data_iter)
-                    # Transfer to pinned memory for faster H2D
                     if self.pin_memory and tokens.device.type == 'cpu':
                         tokens = tokens.pin_memory()
                         targets = targets.pin_memory()
                     yield tokens, targets
                 except StopIteration:
                     break
-        
+
         return generator()
-    
+
     def __iter__(self) -> Iterator[Tuple[torch.Tensor, torch.Tensor]]:
         """Return async iterator."""
         prefetch_iter = self._create_prefetch_iterator()
-        
+
         for tokens, targets in prefetch_iter:
-            # Non-blocking transfer to GPU
             tokens_gpu = tokens.to(self.device, non_blocking=True)
             targets_gpu = targets.to(self.device, non_blocking=True)
             yield tokens_gpu, targets_gpu
-    
+
     def benchmark(self, num_batches: int = 100) -> dict:
-        """Measure data loading throughput.
-        
-        Args:
-            num_batches: Number of batches to benchmark
-            
-        Returns:
-            Dict with batches_per_sec, tokens_per_sec, elapsed_sec
-        """
+        """Measure data loading throughput."""
         start = time.time()
         for i, (tokens, targets) in enumerate(self):
             if i >= num_batches:
                 break
-        
+
         elapsed = time.time() - start
         batches_per_sec = num_batches / elapsed
         tokens_loaded = num_batches * self.batch_size * self.seq_len
-        
+
         return {
             'batches_per_sec': batches_per_sec,
             'tokens_per_sec': tokens_loaded / elapsed,

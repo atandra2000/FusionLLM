@@ -147,8 +147,3 @@ class FusionLLM(nn.Module):
     def get_moe_layers(self) -> list[DeepSeekMoE]:
         """Return all MoE layers."""
         return [layer.ffn for layer in self.layers if not layer.is_gdn]
-
-
-def build_fusionllm(config: dict) -> FusionLLM:
-    """Build FusionLLM model."""
-    return FusionLLM(config)

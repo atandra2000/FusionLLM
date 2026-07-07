@@ -59,23 +59,3 @@ def compute_validation_loss(
         "ppl": ppl,
         "n_tokens": total_tokens,
     }
-
-
-@torch.no_grad()
-def validate_forward_shape(
-    model: nn.Module,
-    batch_size: int = 2,
-    seq_len: int = 4096,
-    device: torch.device = torch.device("cpu"),
-) -> None:
-    """Validate that forward pass produces correct output shape."""
-    model.eval()
-    tokens = torch.randint(0, 64000, (batch_size, seq_len), device=device)
-    logits = model(tokens)
-
-    expected_shape = (batch_size, seq_len, 64000)
-    assert logits.shape == expected_shape, \
-        f"Expected shape {expected_shape}, got {logits.shape}"
-
-    model.train()
-    print(f"[validation] Forward shape OK: {logits.shape}")

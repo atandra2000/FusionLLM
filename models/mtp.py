@@ -42,8 +42,10 @@ class MTPModule(nn.Module):
         dim = config["dim"]
         self.norm_h = nn.RMSNorm(dim, eps=1e-6)
         self.norm_e = nn.RMSNorm(dim, eps=1e-6)
-        self.proj = None if depth >= 2 else nn.Linear(2 * dim, dim, bias=False)
-        self.proj_aux = nn.Linear(2 * dim, dim, bias=False) if depth >= 2 else None
+        # ponytail: was proj/proj_aux split gated on depth, but both branches
+        # built the exact same nn.Linear(2*dim, dim, bias=False) and forward
+        # used whichever was non-None — collapse to one projection.
+        self.proj = nn.Linear(2 * dim, dim, bias=False)
         self.block = MTPTransformerBlock(config)
         self.norm_out = nn.RMSNorm(dim, eps=1e-6)
         self.output_head: nn.Linear | None = None
@@ -55,8 +57,7 @@ class MTPModule(nn.Module):
         """Forward pass."""
         if self.output_head is None:
             raise RuntimeError(f"MTPModule(depth={self.depth}): output_head not set.")
-        proj = self.proj_aux if self.proj_aux is not None else self.proj
-        fused = proj(torch.cat([self.norm_h(hidden), self.norm_e(target_emb)], dim=-1))
+        fused = self.proj(torch.cat([self.norm_h(hidden), self.norm_e(target_emb)], dim=-1))
         h = self.block(fused)
         return self.output_head(self.norm_out(h)), h
 

@@ -19,7 +19,7 @@ from training.optimizer import NorMuon, CautiousAdamW, build_optimizers
 from training.scheduler import WSDScheduler
 from training.checkpoint import save_checkpoint, load_checkpoint, find_latest_checkpoint
 from training.validation import compute_validation_loss
-from training.data_loader import AsyncDataLoader
+from training.data_loader import to_device_batches
 
 
 class Trainer:
@@ -30,7 +30,6 @@ class Trainer:
         self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
         self.dtype = torch.bfloat16 if config.get("dtype", "bf16") == "bf16" else torch.float32
 
-        config["use_checkpoint_per_layer"] = True
         self.model = FusionLLM(config).to(self.device)
         self._log(f"Model built: {self._count_params():,} total params")
         self._log("Selective checkpointing enabled: MLA layers checkpointed, GDN layers not")
@@ -105,7 +104,6 @@ class Trainer:
         self.wandb_enabled = config.get("wandb_enabled", True) and self.device.type == "cuda"
         self.wandb_run = None
         self._init_wandb()
-        self.scaler = torch.amp.GradScaler("cuda", enabled=False)
 
     def _log(self, msg: str) -> None:
         print(f"[trainer] {msg}")
@@ -166,7 +164,7 @@ class Trainer:
             balance_loss = self.balance_loss_alpha * balance_loss
             loss = loss + balance_loss
 
-        self.scaler.scale(loss).backward()
+        loss.backward()
         loss_val = loss.item()
         metrics = {
             "loss": loss_val,
@@ -176,7 +174,6 @@ class Trainer:
 
         if self.loss_nan_skip and (math.isnan(loss_val) or math.isinf(loss_val)):
             self._log(f"WARNING: NaN/Inf loss at step {self.step}, skipping")
-            self.scaler.update()
             return metrics
         return metrics
 
@@ -192,7 +189,6 @@ class Trainer:
         if self.muon_opt is not None:
             self.muon_opt.step()
         self.adamw_opt.step()
-        self.scaler.update()
         train_model = self._get_train_model()
         train_model.zero_grad(set_to_none=True)
 
@@ -248,20 +244,18 @@ class Trainer:
         self._log(f"Effective batch size: {self.grad_accum_steps * self.micro_batch_size} seqs")
         self._log(f"Tokens per step: {self.grad_accum_steps * self.micro_batch_size * self.max_seq_len}")
 
-        async_loader = AsyncDataLoader(
-            data_iter,
-            batch_size=self.micro_batch_size,
-            seq_len=self.max_seq_len,
-            vocab_size=self.vocab_size,
-            device=self.device,
-            prefetch_factor=2,
-            pin_memory=True,
-        )
+        # ponytail: was AsyncDataLoader — prefetch/pin_memory never read; a
+        # generator does the only real work (non-blocking .to(device)).
+        data_iter = to_device_batches(data_iter, self.device)
 
         if self.step == 0:
-            bench = async_loader.benchmark(num_batches=10)
-            self._log(f"Data loading: {bench['tokens_per_sec']:.0f} tokens/sec")
-        data_iter = async_loader
+            start = time.time()
+            for i, _ in enumerate(data_iter):
+                if i >= 9:
+                    break
+            elapsed = time.time() - start
+            tps = 10 * self.micro_batch_size * self.max_seq_len / max(elapsed, 1e-9)
+            self._log(f"Data loading: {tps:.0f} tokens/sec")
         train_model = self._get_train_model()
         t_start = time.time()
 

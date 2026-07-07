@@ -5,7 +5,7 @@ from .mla import MultiHeadLatentAttention
 from .moe import DeepSeekMoE
 from .gdn import GatedDeltaNet
 from .mtp import MultiTokenPrediction
-from .fusionllm import FusionLLM, build_fusionllm
+from .fusionllm import FusionLLM
 
 __all__ = [
     "MultiHeadLatentAttention",
@@ -13,5 +13,4 @@ __all__ = [
     "GatedDeltaNet",
     "MultiTokenPrediction",
     "FusionLLM",
-    "build_fusionllm",
 ]

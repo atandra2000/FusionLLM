@@ -4,7 +4,7 @@
 import argparse
 import time
 import torch
-from models.fusionllm import build_fusionllm
+from models.fusionllm import FusionLLM
 
 
 def get_config() -> dict:
@@ -37,7 +37,6 @@ def get_config() -> dict:
         "logit_softcap": 15.0,
         "tie_embeddings": True,
         "dtype": "bf16",
-        "use_checkpoint_per_layer": True,
         "wandb_enabled": False,
         "micro_batch_size": 4,
         "gradient_accumulation_steps": 8,
@@ -71,7 +70,7 @@ def benchmark(steps: int):
     print()
     
     print("Building model...")
-    model = build_fusionllm(config).to(device)
+    model = FusionLLM(config).to(device)
     
     if config.get("use_compile") and device.type == "cuda":
         print("Compiling model (this may take 1-2 minutes)...")

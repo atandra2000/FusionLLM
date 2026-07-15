@@ -88,7 +88,10 @@ class Trainer:
         self.max_seq_len = 4096
         self.vocab_size = 64000
         self.grad_clip = 1.0
-        self.balance_loss_alpha = 1e-4
+        # ponytail: aux load-balance loss disabled — DeepSeek-V3 uses aux-loss-free
+        # routing (just dynamic gate bias, no auxiliary loss in the objective).
+        # Set to a non-zero value to re-enable the legacy aux-loss path.
+        self.balance_loss_alpha = 0.0
         self.bias_update_speed = 1e-3
         self.bias_update_every = 10
         self.save_dir = "checkpoints/pretrain"

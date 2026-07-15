@@ -4,7 +4,6 @@
 from __future__ import annotations
 
 import math
-from typing import Callable
 
 import torch
 import torch.nn as nn
@@ -118,31 +117,33 @@ class FusionLLM(nn.Module):
                 if module.weight is not None:
                     nn.init.ones_(module.weight)
 
-    def forward(self, tokens: torch.Tensor, start_pos: int = 0) -> torch.Tensor:
-        """Forward pass (training)."""
-        B, T = tokens.shape
-        assert T <= self.max_seq_len, f"seq_len {T} > max_seq_len {self.max_seq_len}"
-
+    def _run_layers(self, tokens: torch.Tensor, return_hidden: bool) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
+        """Run the 24-layer stack, honoring per-layer use_checkpoint. Returns hidden (+ logits)."""
         x = self.embed(tokens)
         for layer in self.layers:
-            x = torch.utils.checkpoint.checkpoint(layer, x, use_reentrant=False) if layer.use_checkpoint else layer(x)
-        x = self.norm(x)
-        logits = self.head(x)
-
-        if self.logit_softcap > 0:
-            logits = softcap(logits, cap=self.logit_softcap)
-        return logits
-
-    def forward_with_hidden(self, tokens: torch.Tensor, start_pos: int = 0) -> tuple[torch.Tensor, torch.Tensor]:
-        """Forward pass returning hidden state (for MTP)."""
-        x = self.embed(tokens)
-        for layer in self.layers:
-            x = layer(x)
+            if layer.use_checkpoint and self.training:
+                x = torch.utils.checkpoint.checkpoint(layer, x, use_reentrant=False)
+            else:
+                x = layer(x)
         hidden = self.norm(x)
         logits = self.head(hidden)
         if self.logit_softcap > 0:
             logits = softcap(logits, cap=self.logit_softcap)
-        return logits, hidden
+        if return_hidden:
+            return logits, hidden
+        return logits
+
+    def forward(self, tokens: torch.Tensor, start_pos: int = 0) -> torch.Tensor:
+        """Forward pass (training / inference)."""
+        B, T = tokens.shape
+        assert T <= self.max_seq_len, f"seq_len {T} > max_seq_len {self.max_seq_len}"
+        return self._run_layers(tokens, return_hidden=False)
+
+    def forward_with_hidden(self, tokens: torch.Tensor, start_pos: int = 0) -> tuple[torch.Tensor, torch.Tensor]:
+        """Forward pass returning hidden state (for MTP). Honors per-layer checkpointing."""
+        B, T = tokens.shape
+        assert T <= self.max_seq_len, f"seq_len {T} > max_seq_len {self.max_seq_len}"
+        return self._run_layers(tokens, return_hidden=True)
 
     def get_moe_layers(self) -> list[DeepSeekMoE]:
         """Return all MoE layers."""

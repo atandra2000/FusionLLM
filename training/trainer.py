@@ -173,17 +173,26 @@ class Trainer:
             balance_loss = self.balance_loss_alpha * balance_loss
             loss = loss + balance_loss
 
-        loss.backward()
         loss_val = loss.item()
+        # NaN/Inf check BEFORE backward — applying NaN gradients corrupts the
+        # model permanently on the first bad batch. Signal the caller to skip
+        # the optimizer step instead of returning metrics that look fine.
+        if self.loss_nan_skip and (math.isnan(loss_val) or math.isinf(loss_val)):
+            self._log(f"WARNING: NaN/Inf loss at step {self.step}, skipping optimizer step")
+            metrics = {
+                "loss": loss_val,
+                "main_loss": float(loss_val),
+                "balance_loss": 0.0,
+                "skip": True,
+            }
+            return metrics
+
+        loss.backward()
         metrics = {
             "loss": loss_val,
             "main_loss": main_loss.item() if not isinstance(main_loss, torch.Tensor) or main_loss.dim() == 0 else main_loss.item(),
             "balance_loss": balance_loss.item(),
         }
-
-        if self.loss_nan_skip and (math.isnan(loss_val) or math.isinf(loss_val)):
-            self._log(f"WARNING: NaN/Inf loss at step {self.step}, skipping")
-            return metrics
         return metrics
 
     def optimizer_step(self) -> dict[str, float]:
@@ -270,22 +279,40 @@ class Trainer:
 
         while self.step < total_steps:
             accum_loss = 0.0
+            accum_count = 0
+            skip_step = False
             for micro_step in range(self.grad_accum_steps):
                 tokens, targets = next(data_iter)
                 if tokens.size(0) != self.micro_batch_size:
                     continue
                 metrics = self.train_step(tokens, targets)
-                loss = metrics["loss"] / self.grad_accum_steps
-                accum_loss += loss
+                # NaN/Inf batch — abort the accumulation, drop the gradients,
+                # skip the optimizer step so NaN never touches the params.
+                if metrics.get("skip"):
+                    train_model.zero_grad(set_to_none=True)
+                    skip_step = True
+                    break
+                # Sum raw per-micro-step losses; the final log averages once.
+                accum_loss += metrics["loss"]
+                accum_count += 1
+
+            if skip_step:
+                self._log(f"step {self.step}: skipped (NaN/Inf)")
+                self.step += 1
+                self.global_step += 1
+                continue
 
             opt_metrics = self.optimizer_step()
-            self.token_count += self.grad_accum_steps * self.micro_batch_size * self.max_seq_len
+            # Token count is the sum of trained tokens, not the nominal
+            # accumulation size — if any micro-batches were skipped, this
+            # would otherwise overstate progress.
+            self.token_count += accum_count * self.micro_batch_size * self.max_seq_len
 
             if self.step % self.log_interval == 0:
                 elapsed = time.time() - t_start
                 tokens_per_sec = self.token_count / elapsed if elapsed > 0 else 0
                 log_metrics = {
-                    "loss": accum_loss / self.grad_accum_steps,
+                    "loss": accum_loss / max(accum_count, 1),
                     "step": self.step,
                     "lr": opt_metrics.get("lr", 0),
                     "grad_norm": opt_metrics.get("grad_norm", 0),

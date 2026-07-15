@@ -13,11 +13,22 @@ def generate_synthetic_batch(
     seq_len: int,
     vocab_size: int,
     device: torch.device = torch.device("cpu"),
+    seed: int = 42,
 ) -> tuple[torch.Tensor, torch.Tensor]:
-    """Generate a synthetic batch of tokens for validation."""
-    tokens = torch.randint(0, vocab_size, (batch_size, seq_len), device=device)
-    targets = torch.randint(0, vocab_size, (batch_size, seq_len), device=device)
-    return tokens, targets
+    """Generate a deterministic synthetic batch.
+
+    Ponytail: same uniform-random data as before, but seeded so a second
+    call (e.g. next eval) produces a different batch deterministically
+    rather than re-sampling from the live RNG. The batch is still
+    uniform-random, so an untrained model will hit ~ln(vocab_size); the
+    point of seeding is reproducibility, not realism. Replace with a real
+    held-out corpus once the data pipeline exists.
+    """
+    gen = torch.Generator(device="cpu")
+    gen.manual_seed(seed)
+    tokens = torch.randint(0, vocab_size, (batch_size, seq_len), generator=gen)
+    targets = torch.randint(0, vocab_size, (batch_size, seq_len), generator=gen)
+    return tokens.to(device), targets.to(device)
 
 
 @torch.no_grad()

@@ -86,24 +86,27 @@ class Trainer:
         self.global_step = 0
         self.token_count = 0
         self.best_loss = float("inf")
-        self.grad_accum_steps = 8
-        self.micro_batch_size = 4
-        self.max_seq_len = 4096
-        self.vocab_size = 64000
-        self.grad_clip = 1.0
+        # Read batch / sequence / vocab / training-loop constants from config;
+        # fall back to A100 80GB defaults. The plain attribute writes were
+        # a Bug F footgun: passing gradient_accumulation_steps=16 in the
+        # config had no effect.
+        self.micro_batch_size = config.get("micro_batch_size", 4)
+        self.grad_accum_steps = config.get("gradient_accumulation_steps", 8)
+        self.max_seq_len = config.get("max_seq_len", 4096)
+        self.vocab_size = config.get("vocab_size", 64000)
+        self.grad_clip = config.get("grad_clip", 1.0)
         # ponytail: aux load-balance loss disabled — DeepSeek-V3 uses aux-loss-free
         # routing (just dynamic gate bias, no auxiliary loss in the objective).
         # Set to a non-zero value to re-enable the legacy aux-loss path.
-        self.balance_loss_alpha = 0.0
-        self.bias_update_speed = 1e-3
-        self.bias_update_every = 10
-        self.save_dir = "checkpoints/pretrain"
-        self.save_interval = 2000
-        self.log_interval = 50
-        self.eval_interval = 5000
-        self.max_keep = 3
-        self.loss_spike_threshold = 3.0
-        self.grad_norm_threshold = 10.0
+        self.balance_loss_alpha = config.get("balance_loss_alpha", 0.0)
+        self.bias_update_speed = config.get("bias_update_speed", 1e-3)
+        self.bias_update_every = config.get("bias_update_every", 10)
+        self.save_dir = config.get("save_dir", "checkpoints/pretrain")
+        self.save_interval = config.get("save_interval", 2000)
+        self.log_interval = config.get("log_interval", 50)
+        self.eval_interval = config.get("eval_interval", 5000)
+        self.max_keep = config.get("max_keep", 3)
+        self.grad_norm_threshold = config.get("grad_norm_threshold", 10.0)
         self.loss_nan_skip = True
         self.empty_cache_every = 100
 

@@ -16,7 +16,7 @@ import torch.nn.functional as F
 from models.fusionllm import FusionLLM
 from models.mtp import MultiTokenPrediction
 from training.optimizer import NorMuon, CautiousAdamW, build_optimizers
-from training.scheduler import WSDScheduler
+from training.scheduler import WSDScheduler, JointWSDScheduler
 from training.checkpoint import save_checkpoint, load_checkpoint, find_latest_checkpoint
 from training.validation import compute_validation_loss
 from training.data_loader import to_device_batches
@@ -68,10 +68,13 @@ class Trainer:
         stable_frac = config.get("wsd_stable_frac", 0.84)
         min_lr_ratio = config.get("min_lr_ratio", 0.1)
 
-        # Scheduler for primary optimizer (AdamW)
-        adamw_opt_for_sched = self.adamw_opt
-        self.scheduler = WSDScheduler(
-            adamw_opt_for_sched,
+        # Joint WSD scheduler drives BOTH optimizers with one multiplicative factor,
+        # so the lr_muon/lr_adamw ratio stays constant across all phases.
+        sched_opts = [self.adamw_opt]
+        if self.muon_opt is not None:
+            sched_opts = [self.muon_opt, self.adamw_opt]
+        self.scheduler = JointWSDScheduler(
+            sched_opts,
             total_steps=total_steps,
             warmup_frac=warmup_frac,
             stable_frac=stable_frac,

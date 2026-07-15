@@ -103,3 +103,11 @@ class JointWSDScheduler:
         if not self.optimizers or not self.optimizers[0].param_groups:
             return [0.0]
         return [g["lr"] for g in self.optimizers[0].param_groups]
+
+    def state_dict(self) -> dict:
+        """Persist scheduler position so checkpoints can resume training."""
+        return {"last_epoch": self.last_epoch}
+
+    def load_state_dict(self, state_dict: dict) -> None:
+        """Restore scheduler position from a checkpoint."""
+        self.last_epoch = state_dict.get("last_epoch", -1)

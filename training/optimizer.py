@@ -111,8 +111,30 @@ class CautiousAdamW(Optimizer):
 
 
 def build_optimizers(model: nn.Module, adamw_lr: float = 3e-4, muon_lr: float = 0.02, muon_momentum: float = 0.95, adamw_betas: tuple[float, float] = (0.9, 0.95), weight_decay: float = 0.1, cautious_wd: bool = True) -> tuple[NorMuon | None, CautiousAdamW]:
-    """Build NorMuon (matrix params) + CautiousAdamW (rest)."""
-    exclude_patterns = ("embed", "head", "norm", "bias", "gate.bias", "proj", "A_log", "dt_bias", "D")
+    """Build NorMuon (2D matrices) + CautiousAdamW (1D / explicit non-matrix params)."""
+    # ponytail: exact-name allowlist for params that should NOT go to NorMuon
+    # even when they're 2D. MoE experts, MLA/GDN/MoE weight matrices → NorMuon.
+    # 1D (norm γ, biases) and explicit non-matrix params → AdamW.
+    ADAMW_EXACT_NAMES = {
+        "embed.weight",       # tied with head; sparse updates; large embedding
+        "head.weight",        # tied with embed
+        "norm.weight",        # RMSNorm γ
+        "gate.bias",          # MoE gate bias (driven by update_gate_bias, not Adam)
+        "A_log",              # GDN log-decay
+        "dt_bias",            # GDN dt bias
+        "D",                  # GDN per-head skip
+    }
+
+    def goes_to_adamw(name: str, p: torch.Tensor) -> bool:
+        if p.ndim < 2:
+            return True
+        # Match against exact full name or as a dot-prefixed suffix
+        # (e.g. "embed.weight" matches "embed.weight" and "a.b.embed.weight";
+        # "A_log" matches "layers.0.attn.A_log" via the suffix check).
+        for entry in ADAMW_EXACT_NAMES:
+            if name == entry or name.endswith("." + entry):
+                return True
+        return False
 
     muon_params, adamw_params = [], []
     seen: set[int] = set()
@@ -120,12 +142,7 @@ def build_optimizers(model: nn.Module, adamw_lr: float = 3e-4, muon_lr: float = 
         if not p.requires_grad or id(p) in seen:
             continue
         seen.add(id(p))
-        is_matrix = p.ndim >= 2
-        is_excluded = any(pattern in name.lower() for pattern in exclude_patterns)
-        if is_matrix and not is_excluded:
-            muon_params.append(p)
-        else:
-            adamw_params.append(p)
+        (adamw_params if goes_to_adamw(name, p) else muon_params).append(p)
 
     muon_opt = NorMuon(muon_params, lr=muon_lr, betas=(muon_momentum, 0.95), weight_decay=weight_decay, cautious_wd=cautious_wd) if muon_params else None
     adamw_opt = CautiousAdamW(adamw_params, lr=adamw_lr, betas=adamw_betas, weight_decay=0.0, cautious_wd=False)

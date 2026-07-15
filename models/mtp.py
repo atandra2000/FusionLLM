@@ -73,6 +73,14 @@ class MultiTokenPrediction(nn.Module):
         self.softcap = config.get("mtp_softcap", True)
         self.softcap_value = config.get("mtp_softcap_value", 15.0)
         self.mtp_loss_weights = config.get("mtp_loss_weights", [config.get("mtp_loss_weight_1", 0.10), config.get("mtp_loss_weight_2", 0.05)])
+        # Validate up front so the IndexError doesn't surface on the first forward.
+        if self.depth > 0 and len(self.mtp_loss_weights) < self.depth:
+            raise ValueError(
+                f"mtp_loss_weights has {len(self.mtp_loss_weights)} entries but "
+                f"mtp_depth={self.depth} requires at least {self.depth}. "
+                f"Pass `mtp_loss_weights=[w1, w2, ...]` (one per depth) or set "
+                f"mtp_depth <= len(mtp_loss_weights)."
+            )
         self.embed = main_model.embed
         if self.depth > 0:
             self.mtp_modules = nn.ModuleList([MTPModule(config, d + 1) for d in range(self.depth)])

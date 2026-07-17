@@ -1,5 +1,5 @@
 # models/fusionllm.py
-"""FusionLLM-v1: Hybrid MLA + GDN + MoE + MTP (A100 80GB optimized)."""
+"""FusionLLM: Hybrid MLA + GDN + MoE + MTP (4× A100 80GB SXM, FSDP-2)."""
 
 from __future__ import annotations
 
@@ -79,7 +79,7 @@ def muP_init(model: nn.Module, config: dict) -> None:
 
 
 class FusionLLM(nn.Module):
-    """FusionLLM-v1: Full model (24 layers: 16 MLA + 8 GDN)."""
+    """FusionLLM: Full model (32 layers: 8 MLA + 24 GDN)."""
 
     def __init__(self, config: dict):
         super().__init__()

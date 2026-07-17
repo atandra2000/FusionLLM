@@ -1,5 +1,5 @@
 # training/__init__.py
-"""FusionLLM-v1 training infrastructure."""
+"""FusionLLM training infrastructure."""
 
 from .optimizer import NorMuon, CautiousAdamW, build_optimizers
 from .scheduler import WSDScheduler

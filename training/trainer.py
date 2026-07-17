@@ -1,5 +1,5 @@
 # training/trainer.py
-"""Pre-training loop for FusionLLM-v1 (A100 80GB optimized)."""
+"""Pre-training loop for FusionLLM (4× A100 80GB SXM, FSDP-2, BF16)."""
 
 from __future__ import annotations
 
@@ -23,7 +23,7 @@ from training.data_loader import to_device_batches
 
 
 class Trainer:
-    """Pre-training orchestrator for FusionLLM-v1 (A100 80GB, BF16)."""
+    """Pre-training orchestrator for FusionLLM (4× A100 80GB, BF16, FSDP-2)."""
 
     def __init__(self, config: dict):
         self.config = config

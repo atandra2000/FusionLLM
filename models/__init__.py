@@ -1,5 +1,5 @@
 # models/__init__.py
-"""FusionLLM-v1 model components."""
+"""FusionLLM model components."""
 
 from .mla import MultiHeadLatentAttention
 from .moe import DeepSeekMoE
